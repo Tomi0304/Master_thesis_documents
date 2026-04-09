@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-TRMS — Controleur PD + compensation gravitationnelle
+TRMS — Controleur PID + compensation gravitationnelle
 Rotor principal seul (GPIO 12), IMU BNO085
 
-Modele de gravite corrige pour bras en equilibre proche de l'horizontal :
-    tau_grav = M*g*L*sin(alpha_rest + psi*)
-    ou alpha_rest est l'angle de repos depuis la verticale (mesure auto par l'IMU)
+tau_grav = M*g*L*sin(alpha_rest + psi*)
 
 GPIO 12 : Main rotor (PWM0 hardware)
 GPIO 13 : Tail rotor  (PWM1 hardware) — non utilise ici
 
 Usage :
     sudo pigpiod
-    python3 trms_controller.py --kp 1.0 --kd 1.5 --kg 0.25 --setpoint 6 --throttle 0.55
+    python3 trms_controller.py --kp 1.5 --ki 0.15 --kd 0.4 --kg 0.25 --setpoint -20
 """
 
 import time
@@ -31,16 +29,20 @@ from adafruit_bno08x.i2c import BNO08X_I2C
 ENCODER_PIN_A    = 27
 ENCODER_PIN_B    = 17
 ESC_MAIN_PWM_PIN = 12
+
 ENCODER_CPR_X4   = 2000
 ESC_NEUTRAL_US   = 1500
 ESC_MIN_US       = 1100
 ESC_MAX_US       = 1900
 ESC_DEADBAND_US  = 25
+
 CONTROL_FREQ_HZ  = 50.0
 DT               = 1.0 / CONTROL_FREQ_HZ
 MAX_PSI_DEG      = 90.0
+
 CALIB_SAMPLES    = 50
 CALIB_PERIOD_S   = 2.0
+
 THROTTLE_LIMIT   = 0.60
 
 
@@ -141,10 +143,8 @@ class IMU_BNO085:
         if yaw is None:
             return None
         delta = yaw - self.yaw_offset
-        if delta >  180.0:
-            delta -= 360.0
-        if delta < -180.0:
-            delta += 360.0
+        if delta >  180.0: delta -= 360.0
+        if delta < -180.0: delta += 360.0
         return delta
 
     def get_gyro_pitch_rate(self):
@@ -231,28 +231,49 @@ class ESC:
         self.pi.set_servo_pulsewidth(self.pin, 0)
 
 
-class PDController:
+class PIDController:
 
-    def __init__(self, kp, kd, kg, setpoint_deg, rest_angle_deg=80.0):
+    def __init__(self, kp, ki, kd, kg, setpoint_deg, rest_angle_deg=80.0):
         self.kp         = kp
+        self.ki         = ki
         self.kd         = kd
         self.kg         = kg
         self.setpoint   = setpoint_deg
         self.rest_angle = rest_angle_deg
 
+        # Integrale avec anti-windup
+        self._integral      = 0.0
+        self._integral_max  = 30.0   # deg*s — limite anti-windup
+
+    def reset_integral(self):
+        self._integral = 0.0
+
     def compute(self, psi_deg, psi_dot_dps):
-        error          = self.setpoint - psi_deg
-        u_p            = self.kp * error
-        u_d            = -self.kd * psi_dot_dps
+        error = self.setpoint - psi_deg
+
+        # Terme P
+        u_p = self.kp * error
+
+        # Terme I avec anti-windup par clamping
+        self._integral += error * DT
+        self._integral = max(-self._integral_max, min(self._integral_max, self._integral))
+        u_i = self.ki * self._integral
+
+        # Terme D
+        u_d = -self.kd * psi_dot_dps
+
+        # Feedforward gravitationnel
         phys_angle_rad = math.radians(self.rest_angle + self.setpoint)
-        if self.setpoint >= 0:
-            phys_angle_rad = math.radians(self.rest_angle + self.setpoint)
-            u_g = self.kg * math.sin(phys_angle_rad) * 90.0
-        else:
-            u_g = 0.0
-        u_raw          = u_p + u_d + u_g
-        u_norm         = max(-THROTTLE_LIMIT, min(THROTTLE_LIMIT, u_raw / 90.0))
-        return u_norm, error, u_p / 90.0, u_d / 90.0, u_g / 90.0
+        u_g = self.kg * math.sin(phys_angle_rad) * 90.0
+
+        u_raw  = u_p + u_i + u_d + u_g
+        u_norm = max(-THROTTLE_LIMIT, min(THROTTLE_LIMIT, u_raw / 90.0))
+
+        # Anti-windup par back-calculation : si on sature, on gele l'integrale
+        if abs(u_raw / 90.0) > THROTTLE_LIMIT:
+            self._integral -= error * DT
+
+        return u_norm, error, u_p / 90.0, u_i / 90.0, u_d / 90.0, u_g / 90.0
 
     def to_pwm(self, u_norm):
         u_esc = -u_norm
@@ -267,16 +288,16 @@ class PDController:
 
 class TRMSController:
 
-    def __init__(self, kp, kd, kg, setpoint_deg, rest_angle_override=None):
+    def __init__(self, kp, ki, kd, kg, setpoint_deg, rest_angle_override=None):
         self.running = False
         self.pi = pigpio.pi()
         if not self.pi.connected:
             raise RuntimeError("pigpiod non lance ! → sudo pigpiod")
 
         print("=" * 66)
-        print("  TRMS — Controleur PD + Gravite (rotor principal seul)")
+        print("  TRMS — Controleur PID + Gravite (rotor principal seul)")
         print(f"  Consigne psi* = {setpoint_deg:.1f} deg")
-        print(f"  Kp={kp:.2f}  Kd={kd:.2f}  Kg={kg:.2f}")
+        print(f"  Kp={kp:.2f}  Ki={ki:.3f}  Kd={kd:.2f}  Kg={kg:.2f}")
         print(f"  Throttle max  = {THROTTLE_LIMIT*100:.0f}%")
         print("=" * 66)
 
@@ -299,20 +320,17 @@ class TRMSController:
             rest_angle = self.imu.get_rest_angle_from_vertical()
             print(f"[CAL]  Angle de repos (IMU auto) = {rest_angle:.1f} deg depuis verticale")
 
-        phys_at_sp   = rest_angle + setpoint_deg
-        u_g_preview  = kg * math.sin(math.radians(phys_at_sp))
+        phys_at_sp  = rest_angle + setpoint_deg
+        u_g_preview = kg * math.sin(math.radians(phys_at_sp))
         print(f"[CAL]  Angle physique au setpoint = {phys_at_sp:.1f} deg")
         print(f"[CAL]  u_G prevu au setpoint      = {u_g_preview:.3f} (norme)")
 
-        self.ctrl = PDController(kp, kd, kg, setpoint_deg, rest_angle_deg=rest_angle)
+        self.ctrl = PIDController(kp, ki, kd, kg, setpoint_deg, rest_angle_deg=rest_angle)
 
         psi_check = self.imu.get_psi()
         if psi_check is not None:
             print(f"[CAL]  psi post-calib = {psi_check:.2f} deg (attendu ~ 0)")
-            if abs(psi_check) > 10.0:
-                print("[CAL]  ATTENTION : ecart important — bras en mouvement ?")
-            else:
-                print("[CAL]  OK")
+            print("[CAL]  OK" if abs(psi_check) <= 10.0 else "[CAL]  ATTENTION : ecart important")
 
         self.encoder.reset()
         print("[ENC]  Position remise a zero")
@@ -321,7 +339,7 @@ class TRMSController:
         os.makedirs("logs", exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.csv_path = (
-            f"logs/trms_kp{kp}_kd{kd}_kg{kg}"
+            f"logs/trms_kp{kp}_ki{ki}_kd{kd}_kg{kg}"
             f"_sp{setpoint_deg}_ra{rest_angle:.0f}"
             f"_thr{THROTTLE_LIMIT}_{ts}.csv"
         )
@@ -330,7 +348,8 @@ class TRMSController:
             "t_s,iteration,"
             "psi_imu_deg,psi_enc_deg,phi_yaw_deg,psi_dot_dps,"
             "setpoint_deg,rest_angle_deg,phys_angle_deg,"
-            "error_deg,u_norm,u_p,u_d,u_g,pwm_us,pitch_raw_deg\n"
+            "error_deg,integral_deg_s,"
+            "u_norm,u_p,u_i,u_d,u_g,pwm_us,pitch_raw_deg\n"
         )
         print(f"[LOG]  CSV → {self.csv_path}")
 
@@ -359,7 +378,7 @@ class TRMSController:
     def run(self):
         self.running = True
         hdr = (f"{'#':>5} | {'psi':>7} | {'enc':>7} | {'phi':>7} | "
-               f"{'psi_d':>7} | {'Err':>7} | {'u':>7} | {'PWM':>5}")
+               f"{'psi_d':>7} | {'Err':>7} | {'I':>7} | {'u':>7} | {'PWM':>5}")
         print(f"\n{hdr}")
         print("-" * len(hdr))
 
@@ -384,7 +403,7 @@ class TRMSController:
                 psi_enc     = self.encoder.get_psi()
                 psi_dot_dps = -math.degrees(self.imu.get_gyro_pitch_rate())
 
-                u, err, u_p, u_d, u_g = self.ctrl.compute(psi, psi_dot_dps)
+                u, err, u_p, u_i, u_d, u_g = self.ctrl.compute(psi, psi_dot_dps)
                 pwm_cmd    = self.ctrl.to_pwm(u)
                 pwm_actual = self.esc.set_pwm(pwm_cmd)
 
@@ -401,14 +420,16 @@ class TRMSController:
                     f"{phi_log},"
                     f"{psi_dot_dps:.4f},"
                     f"{self.ctrl.setpoint:.2f},{self.ctrl.rest_angle:.2f},{phys_angle:.2f},"
-                    f"{err:.4f},{u:.6f},{u_p:.6f},{u_d:.6f},{u_g:.6f},"
+                    f"{err:.4f},{self.ctrl._integral:.4f},"
+                    f"{u:.6f},{u_p:.6f},{u_i:.6f},{u_d:.6f},{u_g:.6f},"
                     f"{pwm_actual},{pr_log}\n"
                 )
 
-                phi_str = f"{phi:+7.1f}" if phi is not None else "    N/A"
+                phi_str = str(round(phi, 1)) if phi is not None else "  N/A"
                 print(
-                    f"\r{it:5d} | {psi:+7.1f} | {psi_enc:+7.1f} | {phi_str} | "
-                    f"{psi_dot_dps:+7.1f} | {err:+7.1f} | {u:+7.3f} | {pwm_actual:5d}",
+                    f"\r{it:5d} | {psi:+7.1f} | {psi_enc:+7.1f} | {phi_str:>7} | "
+                    f"{psi_dot_dps:+7.1f} | {err:+7.1f} | {self.ctrl._integral:+7.2f} | "
+                    f"{u:+7.3f} | {pwm_actual:5d}",
                     end="", flush=True
                 )
 
@@ -438,17 +459,19 @@ class TRMSController:
 
 def main():
     p = argparse.ArgumentParser(
-        description="TRMS — Controleur PD + gravite (rotor principal, IMU)",
+        description="TRMS — Controleur PID + gravite (rotor principal, IMU)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemples :
-  python3 trms_controller.py --kp 1.0 --kd 1.5 --kg 0.25 --setpoint 6
-  python3 trms_controller.py --kp 1.0 --kd 1.5 --kg 0.25 --setpoint 6 --rest-angle 83
+  python3 trms_controller.py --kp 1.5 --ki 0.15 --kd 0.4 --kg 0.25 --setpoint -20
+  python3 trms_controller.py --kp 1.5 --ki 0.10 --kd 0.4 --kg 0.25 --setpoint 6
         """)
 
     p.add_argument("--setpoint",   type=float, default=6.0)
-    p.add_argument("--kp",         type=float, default=1.0)
-    p.add_argument("--kd",         type=float, default=1.5)
+    p.add_argument("--kp",         type=float, default=1.5)
+    p.add_argument("--ki",         type=float, default=0.10,
+                   help="Gain integral (defaut: 0.10)")
+    p.add_argument("--kd",         type=float, default=0.4)
     p.add_argument("--kg",         type=float, default=0.25)
     p.add_argument("--throttle",   type=float, default=0.55)
     p.add_argument("--rest-angle", type=float, default=None,
@@ -461,6 +484,7 @@ Exemples :
 
     ctrl = TRMSController(
         kp                  = args.kp,
+        ki                  = args.ki,
         kd                  = args.kd,
         kg                  = args.kg,
         setpoint_deg        = args.setpoint,

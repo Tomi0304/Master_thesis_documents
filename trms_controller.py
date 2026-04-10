@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-TRMS — Controleur PID + compensation gravitationnelle
+TRMS — Controleur PID + compensation gravitationnelle + slew rate limiter
 Rotor principal seul (GPIO 12), IMU BNO085
 
-tau_grav = M*g*L*sin(alpha_rest + psi*)
+Le slew rate limiter empeche les transitions PWM trop rapides
+qui declenchent le re-armement BLHeli_S bidirectionnel.
 
 GPIO 12 : Main rotor (PWM0 hardware)
 GPIO 13 : Tail rotor  (PWM1 hardware) — non utilise ici
 
 Usage :
     sudo pigpiod
-    python3 trms_controller.py --kp 1.5 --ki 0.15 --kd 0.4 --kg 0.25 --setpoint -20
+    python3 trms_controller.py --kp 1.5 --ki 0.20 --kd 0.4 --kg 0.25 --setpoint -20
 """
 
 import time
@@ -35,6 +36,7 @@ ESC_NEUTRAL_US   = 1500
 ESC_MIN_US       = 1100
 ESC_MAX_US       = 1900
 ESC_DEADBAND_US  = 25
+ESC_SLEW_MAX_US  = 50   # us max par iteration — empeche re-armement BLHeli_S
 
 CONTROL_FREQ_HZ  = 50.0
 DT               = 1.0 / CONTROL_FREQ_HZ
@@ -211,21 +213,32 @@ class EncoderHEDS5540:
 class ESC:
 
     def __init__(self, pi, pin, name="ESC"):
-        self.pi   = pi
-        self.pin  = pin
-        self.name = name
+        self.pi         = pi
+        self.pin        = pin
+        self.name       = name
+        self._pwm_cur   = ESC_NEUTRAL_US
         print(f"[{name}]  Armement ({ESC_NEUTRAL_US} us sur GPIO{pin})...")
         pi.set_servo_pulsewidth(pin, ESC_NEUTRAL_US)
         time.sleep(3)
         print(f"[{name}]  Arme et pret")
 
-    def set_pwm(self, pulse_us):
-        pw = int(max(ESC_MIN_US, min(ESC_MAX_US, pulse_us)))
-        self.pi.set_servo_pulsewidth(self.pin, pw)
-        return pw
+    def set_pwm(self, target_us):
+        """Applique le PWM avec slew rate limiter."""
+        target_us = int(max(ESC_MIN_US, min(ESC_MAX_US, target_us)))
+        delta = target_us - self._pwm_cur
+        delta = max(-ESC_SLEW_MAX_US, min(ESC_SLEW_MAX_US, delta))
+        self._pwm_cur = int(self._pwm_cur + delta)
+        self.pi.set_servo_pulsewidth(self.pin, self._pwm_cur)
+        return self._pwm_cur
 
     def stop(self):
-        self.pi.set_servo_pulsewidth(self.pin, ESC_NEUTRAL_US)
+        """Retour au neutre avec slew."""
+        while self._pwm_cur != ESC_NEUTRAL_US:
+            delta = ESC_NEUTRAL_US - self._pwm_cur
+            delta = max(-ESC_SLEW_MAX_US, min(ESC_SLEW_MAX_US, delta))
+            self._pwm_cur = int(self._pwm_cur + delta)
+            self.pi.set_servo_pulsewidth(self.pin, self._pwm_cur)
+            time.sleep(DT)
 
     def shutdown(self):
         self.pi.set_servo_pulsewidth(self.pin, 0)
@@ -240,10 +253,8 @@ class PIDController:
         self.kg         = kg
         self.setpoint   = setpoint_deg
         self.rest_angle = rest_angle_deg
-
-        # Integrale avec anti-windup
-        self._integral      = 0.0
-        self._integral_max  = 30.0   # deg*s — limite anti-windup
+        self._integral     = 0.0
+        self._integral_max = 60.0
 
     def reset_integral(self):
         self._integral = 0.0
@@ -251,25 +262,21 @@ class PIDController:
     def compute(self, psi_deg, psi_dot_dps):
         error = self.setpoint - psi_deg
 
-        # Terme P
         u_p = self.kp * error
 
-        # Terme I avec anti-windup par clamping
         self._integral += error * DT
         self._integral = max(-self._integral_max, min(self._integral_max, self._integral))
         u_i = self.ki * self._integral
 
-        # Terme D
         u_d = -self.kd * psi_dot_dps
 
-        # Feedforward gravitationnel
         phys_angle_rad = math.radians(self.rest_angle + self.setpoint)
         u_g = self.kg * math.sin(phys_angle_rad) * 90.0
 
         u_raw  = u_p + u_i + u_d + u_g
         u_norm = max(-THROTTLE_LIMIT, min(THROTTLE_LIMIT, u_raw / 90.0))
 
-        # Anti-windup par back-calculation : si on sature, on gele l'integrale
+        # Anti-windup back-calculation
         if abs(u_raw / 90.0) > THROTTLE_LIMIT:
             self._integral -= error * DT
 
@@ -295,10 +302,11 @@ class TRMSController:
             raise RuntimeError("pigpiod non lance ! → sudo pigpiod")
 
         print("=" * 66)
-        print("  TRMS — Controleur PID + Gravite (rotor principal seul)")
+        print("  TRMS — Controleur PID + Gravite + Slew Rate Limiter")
         print(f"  Consigne psi* = {setpoint_deg:.1f} deg")
         print(f"  Kp={kp:.2f}  Ki={ki:.3f}  Kd={kd:.2f}  Kg={kg:.2f}")
         print(f"  Throttle max  = {THROTTLE_LIMIT*100:.0f}%")
+        print(f"  Slew rate max = {ESC_SLEW_MAX_US} us/iter ({ESC_SLEW_MAX_US*CONTROL_FREQ_HZ:.0f} us/s)")
         print("=" * 66)
 
         self.imu     = IMU_BNO085()
@@ -445,9 +453,8 @@ class TRMSController:
             self._cleanup()
 
     def _cleanup(self):
-        print("\n[STOP] Arret moteur...")
+        print("\n[STOP] Arret moteur (slew vers neutre)...")
         self.esc.stop()
-        time.sleep(0.3)
         self.esc.shutdown()
         self.encoder.cancel()
         self.pi.stop()
@@ -459,18 +466,17 @@ class TRMSController:
 
 def main():
     p = argparse.ArgumentParser(
-        description="TRMS — Controleur PID + gravite (rotor principal, IMU)",
+        description="TRMS — Controleur PID + gravite + slew rate limiter",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemples :
-  python3 trms_controller.py --kp 1.5 --ki 0.15 --kd 0.4 --kg 0.25 --setpoint -20
+  python3 trms_controller.py --kp 1.5 --ki 0.20 --kd 0.4 --kg 0.25 --setpoint -20
   python3 trms_controller.py --kp 1.5 --ki 0.10 --kd 0.4 --kg 0.25 --setpoint 6
         """)
 
     p.add_argument("--setpoint",   type=float, default=6.0)
     p.add_argument("--kp",         type=float, default=1.5)
-    p.add_argument("--ki",         type=float, default=0.10,
-                   help="Gain integral (defaut: 0.10)")
+    p.add_argument("--ki",         type=float, default=0.10)
     p.add_argument("--kd",         type=float, default=0.4)
     p.add_argument("--kg",         type=float, default=0.25)
     p.add_argument("--throttle",   type=float, default=0.55)

@@ -36,9 +36,9 @@ ESC_NEUTRAL_US   = 1500
 ESC_MIN_US       = 1100
 ESC_MAX_US       = 1900
 ESC_DEADBAND_US  = 25
-ESC_SLEW_MAX_US  = 50   # us max par iteration — empeche re-armement BLHeli_S
+ESC_SLEW_MAX_US  = 20   
 
-CONTROL_FREQ_HZ  = 50.0
+CONTROL_FREQ_HZ  = 200.0
 DT               = 1.0 / CONTROL_FREQ_HZ
 MAX_PSI_DEG      = 90.0
 
@@ -138,7 +138,7 @@ class IMU_BNO085:
         pitch, _ = self._get_raw()
         if pitch is None:
             return None
-        return -(pitch - self.pitch_offset)
+        return pitch - self.pitch_offset
 
     def get_phi(self):
         _, yaw = self._get_raw()
@@ -254,7 +254,7 @@ class PIDController:
         self.setpoint   = setpoint_deg
         self.rest_angle = rest_angle_deg
         self._integral     = 0.0
-        self._integral_max = 60.0
+        self._integral_max = 120.0
 
     def reset_integral(self):
         self._integral = 0.0
@@ -409,7 +409,7 @@ class TRMSController:
 
                 phi         = self.imu.get_phi()
                 psi_enc     = self.encoder.get_psi()
-                psi_dot_dps = -math.degrees(self.imu.get_gyro_pitch_rate())
+                psi_dot_dps = math.degrees(self.imu.get_gyro_pitch_rate())
 
                 u, err, u_p, u_i, u_d, u_g = self.ctrl.compute(psi, psi_dot_dps)
                 pwm_cmd    = self.ctrl.to_pwm(u)

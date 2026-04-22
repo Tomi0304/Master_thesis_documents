@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-TRMS — Controleur PID + compensation gravitationnelle + slew rate limiter
-Rotor principal seul (GPIO 12), IMU BNO085
+TRMS — Controleur PID + compensation gravitationnelle
+Rotor principal seul (GPIO 12)
 
-Le slew rate limiter empeche les transitions PWM trop rapides
-qui declenchent le re-armement BLHeli_S bidirectionnel.
+Architecture capteurs :
+  - Encodeur HEDS-5540 : source principale pour psi et psi_dot (200 Hz, frais a chaque iter)
+  - IMU BNO085 : calibration initiale uniquement (alpha_rest) + logging yaw phi
+  - psi_dot derive numeriquement depuis encodeur + filtre passe-bas
 
-GPIO 12 : Main rotor (PWM0 hardware)
-GPIO 13 : Tail rotor  (PWM1 hardware) — non utilise ici
+IMU orientee a 180deg autour de Z :
+  - pitch_raw = -85 deg au repos, monte vers 0 en montant
+  - get_rest_angle = -pitch_offset = 85 deg depuis verticale
 
-Usage :
-    sudo pigpiod
-    python3 trms_controller.py --kp 1.5 --ki 0.20 --kd 0.4 --kg 0.25 --setpoint -20
+Slew rate ESC : 20 us/iter @ 200 Hz = 4000 us/s
+Dwell ESC : 400 ms au neutre avant changement de sens
+
+GPIO 12 : Main rotor (PWM0)
+GPIO 13 : Tail rotor  (PWM1) — non utilise
 """
 
 import time
@@ -36,19 +41,27 @@ ESC_NEUTRAL_US   = 1500
 ESC_MIN_US       = 1100
 ESC_MAX_US       = 1900
 ESC_DEADBAND_US  = 25
-ESC_SLEW_MAX_US  = 20   
+ESC_SLEW_MAX_US  = 20
+ESC_DWELL_S      = 0.1
 
 CONTROL_FREQ_HZ  = 200.0
 DT               = 1.0 / CONTROL_FREQ_HZ
-MAX_PSI_DEG      = 90.0
+MAX_PSI_DEG      = 100.0
 
 CALIB_SAMPLES    = 50
 CALIB_PERIOD_S   = 2.0
 
+# Filtre passe-bas sur psi_dot derive encodeur
+# alpha = 0.3 a 200 Hz → coupure ~10 Hz
+PSI_DOT_ALPHA    = 0.3
 THROTTLE_LIMIT   = 0.60
 
-
 class IMU_BNO085:
+    """
+    Utilisee uniquement pour :
+    1. Calibration initiale -> pitch_offset -> alpha_rest
+    2. Logging yaw phi (non controle)
+    """
 
     def __init__(self):
         print("[IMU]  Initialisation BNO085 sur I2C @ 0x4A...")
@@ -61,12 +74,10 @@ class IMU_BNO085:
             pass
         time.sleep(1.0)
         self._enable_feature_safe(BNO_REPORT_ROTATION_VECTOR)
-        time.sleep(0.2)
-        self._enable_feature_safe(BNO_REPORT_GYROSCOPE)
         time.sleep(0.5)
         self.pitch_offset = 0.0
         self.yaw_offset   = 0.0
-        print("[IMU]  BNO085 pret")
+        print("[IMU]  BNO085 pret (calibration + yaw logging)")
 
     def _enable_feature_safe(self, feature, retries=5, delay=0.5):
         for attempt in range(1, retries + 1):
@@ -80,7 +91,7 @@ class IMU_BNO085:
                         self.bno.soft_reset()
                     except AttributeError:
                         pass
-                    time.sleep(1.0)
+                    time.sleep(delay)
         raise RuntimeError(f"[IMU]  Feature {feature} impossible a activer")
 
     def _quat_to_euler(self, qi, qj, qk, qr):
@@ -97,8 +108,7 @@ class IMU_BNO085:
             quat = self.bno.quaternion
             if quat is None:
                 return None, None
-            qi, qj, qk, qr = quat
-            return self._quat_to_euler(qi, qj, qk, qr)
+            return self._quat_to_euler(*quat)
         except Exception:
             return None, None
 
@@ -126,21 +136,21 @@ class IMU_BNO085:
         spread = max(samples_pitch) - min(samples_pitch)
         print(f"[IMU]  pitch_offset = {self.pitch_offset:.2f} deg")
         print(f"[IMU]  yaw_offset   = {self.yaw_offset:.2f} deg")
-        print(f"[IMU]  Dispersion   = {spread:.2f} deg ({len(samples_pitch)} echantillons)")
+        print(f"[IMU]  Dispersion   = {spread:.2f} deg")
         if spread > 3.0:
             print("[IMU]  ATTENTION : dispersion elevee — bras en mouvement ?")
         return True
 
     def get_rest_angle_from_vertical(self):
-        return 90.0 - abs(self.pitch_offset)
-
-    def get_psi(self):
-        pitch, _ = self._get_raw()
-        if pitch is None:
-            return None
-        return pitch - self.pitch_offset
+        """
+        IMU orientee 180 deg autour de Z :
+          pitch_offset ≈ -85 deg au repos
+          → alpha_rest = -pitch_offset = 85 deg depuis verticale
+        """
+        return -self.pitch_offset
 
     def get_phi(self):
+        """Yaw φ pour logging uniquement."""
         _, yaw = self._get_raw()
         if yaw is None:
             return None
@@ -149,18 +159,12 @@ class IMU_BNO085:
         if delta < -180.0: delta += 360.0
         return delta
 
-    def get_gyro_pitch_rate(self):
-        try:
-            gyro = self.bno.gyro
-            if gyro is None:
-                return 0.0
-            _, gy, _ = gyro
-            return gy
-        except Exception:
-            return 0.0
-
 
 class EncoderHEDS5540:
+    """
+    Source principale de mesure a 200 Hz.
+    psi et psi_dot derives depuis les counts encodeur.
+    """
 
     _QUAD_TABLE = [
          0, -1,  1,  0,
@@ -173,15 +177,23 @@ class EncoderHEDS5540:
         self.pi        = pi
         self._position = 0
         self._lock     = threading.Lock()
+
         pi.set_mode(ENCODER_PIN_A, pigpio.INPUT)
         pi.set_mode(ENCODER_PIN_B, pigpio.INPUT)
         pi.set_pull_up_down(ENCODER_PIN_A, pigpio.PUD_OFF)
         pi.set_pull_up_down(ENCODER_PIN_B, pigpio.PUD_OFF)
+
         a = pi.read(ENCODER_PIN_A)
         b = pi.read(ENCODER_PIN_B)
         self._last_state = (a << 1) | b
+
         self._cb_a = pi.callback(ENCODER_PIN_A, pigpio.EITHER_EDGE, self._cb)
         self._cb_b = pi.callback(ENCODER_PIN_B, pigpio.EITHER_EDGE, self._cb)
+
+        # Etat pour la derivee filtree
+        self._psi_prev     = 0.0
+        self._psi_dot_filt = 0.0
+
         print(f"[ENC]  HEDS-5540 (A=GPIO{ENCODER_PIN_A}, B=GPIO{ENCODER_PIN_B}) pret")
 
     def _cb(self, gpio, level, tick):
@@ -199,11 +211,26 @@ class EncoderHEDS5540:
             return self._position
 
     def get_psi(self):
+        """psi en deg, 0 au repos, positif vers le haut."""
         return -((self.position / ENCODER_CPR_X4) * 360.0)
+
+    def get_psi_and_dot(self):
+        """
+        Retourne (psi, psi_dot) en deg et deg/s.
+        psi_dot derive numeriquement + filtre passe-bas.
+        """
+        psi = self.get_psi()
+        psi_dot_raw       = (psi - self._psi_prev) / DT
+        self._psi_dot_filt = (PSI_DOT_ALPHA * psi_dot_raw +
+                              (1.0 - PSI_DOT_ALPHA) * self._psi_dot_filt)
+        self._psi_prev = psi
+        return psi, self._psi_dot_filt
 
     def reset(self):
         with self._lock:
             self._position = 0
+        self._psi_prev     = 0.0
+        self._psi_dot_filt = 0.0
 
     def cancel(self):
         self._cb_a.cancel()
@@ -212,33 +239,58 @@ class EncoderHEDS5540:
 
 class ESC:
 
+    SIDE_NEUTRAL = 0
+    SIDE_REVERSE = -1
+    SIDE_FORWARD = +1
+
     def __init__(self, pi, pin, name="ESC"):
         self.pi         = pi
         self.pin        = pin
         self.name       = name
-        self._pwm_cur   = ESC_NEUTRAL_US
+        self._cur       = ESC_NEUTRAL_US
+        self._side      = self.SIDE_NEUTRAL
+        self._dwell_end = 0.0
         print(f"[{name}]  Armement ({ESC_NEUTRAL_US} us sur GPIO{pin})...")
         pi.set_servo_pulsewidth(pin, ESC_NEUTRAL_US)
         time.sleep(3)
         print(f"[{name}]  Arme et pret")
 
+    def _get_side(self, pw):
+        if pw > ESC_NEUTRAL_US + ESC_DEADBAND_US:
+            return self.SIDE_FORWARD
+        elif pw < ESC_NEUTRAL_US - ESC_DEADBAND_US:
+            return self.SIDE_REVERSE
+        return self.SIDE_NEUTRAL
+
     def set_pwm(self, target_us):
-        """Applique le PWM avec slew rate limiter."""
-        target_us = int(max(ESC_MIN_US, min(ESC_MAX_US, target_us)))
-        delta = target_us - self._pwm_cur
-        delta = max(-ESC_SLEW_MAX_US, min(ESC_SLEW_MAX_US, delta))
-        self._pwm_cur = int(self._pwm_cur + delta)
-        self.pi.set_servo_pulsewidth(self.pin, self._pwm_cur)
-        return self._pwm_cur
+        target_us   = int(max(ESC_MIN_US, min(ESC_MAX_US, target_us)))
+        target_side = self._get_side(target_us)
+        now         = time.monotonic()
+
+        # Changement de sens → dwell
+        if (self._side != self.SIDE_NEUTRAL and
+                target_side != self.SIDE_NEUTRAL and
+                target_side != self._side):
+            target_us   = ESC_NEUTRAL_US
+            self._dwell_end = now + ESC_DWELL_S
+
+        if now < self._dwell_end:
+            target_us = ESC_NEUTRAL_US
+
+        delta     = max(-ESC_SLEW_MAX_US, min(ESC_SLEW_MAX_US, target_us - self._cur))
+        self._cur = int(self._cur + delta)
+        self._side = self._get_side(self._cur)
+        self.pi.set_servo_pulsewidth(self.pin, self._cur)
+        return self._cur
 
     def stop(self):
-        """Retour au neutre avec slew."""
-        while self._pwm_cur != ESC_NEUTRAL_US:
-            delta = ESC_NEUTRAL_US - self._pwm_cur
-            delta = max(-ESC_SLEW_MAX_US, min(ESC_SLEW_MAX_US, delta))
-            self._pwm_cur = int(self._pwm_cur + delta)
-            self.pi.set_servo_pulsewidth(self.pin, self._pwm_cur)
+        while abs(self._cur - ESC_NEUTRAL_US) > ESC_SLEW_MAX_US:
+            delta     = max(-ESC_SLEW_MAX_US, min(ESC_SLEW_MAX_US, ESC_NEUTRAL_US - self._cur))
+            self._cur = int(self._cur + delta)
+            self.pi.set_servo_pulsewidth(self.pin, self._cur)
             time.sleep(DT)
+        self._cur = ESC_NEUTRAL_US
+        self.pi.set_servo_pulsewidth(self.pin, ESC_NEUTRAL_US)
 
     def shutdown(self):
         self.pi.set_servo_pulsewidth(self.pin, 0)
@@ -246,7 +298,7 @@ class ESC:
 
 class PIDController:
 
-    def __init__(self, kp, ki, kd, kg, setpoint_deg, rest_angle_deg=80.0):
+    def __init__(self, kp, ki, kd, kg, setpoint_deg, rest_angle_deg=85.0):
         self.kp         = kp
         self.ki         = ki
         self.kd         = kd
@@ -254,7 +306,7 @@ class PIDController:
         self.setpoint   = setpoint_deg
         self.rest_angle = rest_angle_deg
         self._integral     = 0.0
-        self._integral_max = 120.0
+        self._integral_max = 120   # deg*s — a 200 Hz l'integrale accumule vite
 
     def reset_integral(self):
         self._integral = 0.0
@@ -265,11 +317,13 @@ class PIDController:
         u_p = self.kp * error
 
         self._integral += error * DT
-        self._integral = max(-self._integral_max, min(self._integral_max, self._integral))
+        self._integral  = max(-self._integral_max,
+                              min(self._integral_max, self._integral))
         u_i = self.ki * self._integral
 
         u_d = -self.kd * psi_dot_dps
 
+        # Feedforward gravitationnel sur setpoint
         phys_angle_rad = math.radians(self.rest_angle + self.setpoint)
         u_g = self.kg * math.sin(phys_angle_rad) * 90.0
 
@@ -301,13 +355,16 @@ class TRMSController:
         if not self.pi.connected:
             raise RuntimeError("pigpiod non lance ! → sudo pigpiod")
 
-        print("=" * 66)
-        print("  TRMS — Controleur PID + Gravite + Slew Rate Limiter")
+        print("=" * 70)
+        print("  TRMS — PID | Encodeur 200Hz | IMU calibration+yaw | Slew+Dwell")
         print(f"  Consigne psi* = {setpoint_deg:.1f} deg")
         print(f"  Kp={kp:.2f}  Ki={ki:.3f}  Kd={kd:.2f}  Kg={kg:.2f}")
         print(f"  Throttle max  = {THROTTLE_LIMIT*100:.0f}%")
-        print(f"  Slew rate max = {ESC_SLEW_MAX_US} us/iter ({ESC_SLEW_MAX_US*CONTROL_FREQ_HZ:.0f} us/s)")
-        print("=" * 66)
+        print(f"  Loop          = {CONTROL_FREQ_HZ:.0f} Hz  |  DT = {DT*1000:.1f} ms")
+        print(f"  Slew          = {ESC_SLEW_MAX_US} us/iter = {ESC_SLEW_MAX_US*CONTROL_FREQ_HZ:.0f} us/s")
+        print(f"  Dwell ESC     = {ESC_DWELL_S*1000:.0f} ms")
+        print(f"  psi_dot filtre alpha = {PSI_DOT_ALPHA} (coupure ~{PSI_DOT_ALPHA*CONTROL_FREQ_HZ/(2*math.pi):.1f} Hz)")
+        print("=" * 70)
 
         self.imu     = IMU_BNO085()
         self.encoder = EncoderHEDS5540(self.pi)
@@ -315,7 +372,7 @@ class TRMSController:
         time.sleep(1.0)
 
         print()
-        print("  *** CALIBRATION : bras immobile a sa position de repos ***")
+        print("  *** CALIBRATION IMU : bras immobile a sa position de repos ***")
         print()
         if not self.imu.calibrate():
             self._abort()
@@ -331,33 +388,35 @@ class TRMSController:
         phys_at_sp  = rest_angle + setpoint_deg
         u_g_preview = kg * math.sin(math.radians(phys_at_sp))
         print(f"[CAL]  Angle physique au setpoint = {phys_at_sp:.1f} deg")
-        print(f"[CAL]  u_G prevu au setpoint      = {u_g_preview:.3f} (norme)")
+        print(f"[CAL]  u_G prevu au setpoint      = {u_g_preview:.3f}")
+        print(f"[CAL]  Source controle            = ENCODEUR (psi + psi_dot derive)")
+        print(f"[CAL]  Source logging yaw         = IMU (phi)")
 
-        self.ctrl = PIDController(kp, ki, kd, kg, setpoint_deg, rest_angle_deg=rest_angle)
+        self.ctrl = PIDController(kp, ki, kd, kg, setpoint_deg,
+                                  rest_angle_deg=rest_angle)
 
-        psi_check = self.imu.get_psi()
-        if psi_check is not None:
-            print(f"[CAL]  psi post-calib = {psi_check:.2f} deg (attendu ~ 0)")
-            print("[CAL]  OK" if abs(psi_check) <= 10.0 else "[CAL]  ATTENTION : ecart important")
-
+        # Verification encodeur au repos
         self.encoder.reset()
-        print("[ENC]  Position remise a zero")
+        time.sleep(0.1)
+        psi_enc_check = self.encoder.get_psi()
+        print(f"[ENC]  psi encodeur post-reset = {psi_enc_check:.2f} deg (attendu 0)")
+        print("[ENC]  OK")
 
         from datetime import datetime
         os.makedirs("logs", exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.csv_path = (
-            f"logs/trms_kp{kp}_ki{ki}_kd{kd}_kg{kg}"
+            f"logs/trms_enc_kp{kp}_ki{ki}_kd{kd}_kg{kg}"
             f"_sp{setpoint_deg}_ra{rest_angle:.0f}"
             f"_thr{THROTTLE_LIMIT}_{ts}.csv"
         )
         self.csv_file = open(self.csv_path, "w")
         self.csv_file.write(
             "t_s,iteration,"
-            "psi_imu_deg,psi_enc_deg,phi_yaw_deg,psi_dot_dps,"
+            "psi_enc_deg,psi_dot_enc_dps,phi_yaw_deg,"
             "setpoint_deg,rest_angle_deg,phys_angle_deg,"
             "error_deg,integral_deg_s,"
-            "u_norm,u_p,u_i,u_d,u_g,pwm_us,pitch_raw_deg\n"
+            "u_norm,u_p,u_i,u_d,u_g,pwm_us\n"
         )
         print(f"[LOG]  CSV → {self.csv_path}")
 
@@ -365,9 +424,9 @@ class TRMSController:
         signal.signal(signal.SIGTERM, self._sig)
 
         print()
-        print("=" * 66)
+        print("=" * 70)
         print("  Systeme pret — Ctrl+C pour arreter")
-        print("=" * 66)
+        print("=" * 70)
 
     def _sig(self, signum, frame):
         print("\n[STOP] Arret demande...")
@@ -385,59 +444,52 @@ class TRMSController:
 
     def run(self):
         self.running = True
-        hdr = (f"{'#':>5} | {'psi':>7} | {'enc':>7} | {'phi':>7} | "
-               f"{'psi_d':>7} | {'Err':>7} | {'I':>7} | {'u':>7} | {'PWM':>5}")
+        hdr = (f"{'#':>6} | {'psi':>7} | {'psi_d':>7} | {'phi':>7} | "
+               f"{'Err':>7} | {'I':>7} | {'u':>7} | {'PWM':>5}")
         print(f"\n{hdr}")
         print("-" * len(hdr))
 
         it      = 0
         t_start = time.monotonic()
 
+        # Premiere lecture pour initialiser la derivee
+        self.encoder.get_psi_and_dot()
+
         try:
             while self.running:
                 t0 = time.monotonic()
                 it += 1
 
-                psi = self.imu.get_psi()
-                if psi is None:
-                    time.sleep(DT)
-                    continue
+                # Source principale : encodeur
+                psi, psi_dot_dps = self.encoder.get_psi_and_dot()
 
                 if abs(psi) > MAX_PSI_DEG:
                     self._emergency(f"|psi| = {abs(psi):.1f} > {MAX_PSI_DEG}")
                     break
 
-                phi         = self.imu.get_phi()
-                psi_enc     = self.encoder.get_psi()
-                psi_dot_dps = math.degrees(self.imu.get_gyro_pitch_rate())
+                # Yaw pour logging (IMU, non bloquant)
+                phi = self.imu.get_phi()
 
                 u, err, u_p, u_i, u_d, u_g = self.ctrl.compute(psi, psi_dot_dps)
                 pwm_cmd    = self.ctrl.to_pwm(u)
                 pwm_actual = self.esc.set_pwm(pwm_cmd)
 
                 t_elapsed  = t0 - t_start
-                pitch_raw  = self.imu.get_pitch_raw()
                 phys_angle = self.ctrl.rest_angle + self.ctrl.setpoint
-
-                phi_log = str(round(phi, 4))       if phi       is not None else ""
-                pr_log  = str(round(pitch_raw, 4)) if pitch_raw is not None else ""
+                phi_log    = str(round(phi, 4)) if phi is not None else ""
 
                 self.csv_file.write(
                     f"{t_elapsed:.4f},{it},"
-                    f"{psi:.4f},{psi_enc:.4f},"
-                    f"{phi_log},"
-                    f"{psi_dot_dps:.4f},"
+                    f"{psi:.4f},{psi_dot_dps:.4f},{phi_log},"
                     f"{self.ctrl.setpoint:.2f},{self.ctrl.rest_angle:.2f},{phys_angle:.2f},"
                     f"{err:.4f},{self.ctrl._integral:.4f},"
-                    f"{u:.6f},{u_p:.6f},{u_i:.6f},{u_d:.6f},{u_g:.6f},"
-                    f"{pwm_actual},{pr_log}\n"
+                    f"{u:.6f},{u_p:.6f},{u_i:.6f},{u_d:.6f},{u_g:.6f},{pwm_actual}\n"
                 )
 
                 phi_str = str(round(phi, 1)) if phi is not None else "  N/A"
                 print(
-                    f"\r{it:5d} | {psi:+7.1f} | {psi_enc:+7.1f} | {phi_str:>7} | "
-                    f"{psi_dot_dps:+7.1f} | {err:+7.1f} | {self.ctrl._integral:+7.2f} | "
-                    f"{u:+7.3f} | {pwm_actual:5d}",
+                    f"\r{it:6d} | {psi:+7.1f} | {psi_dot_dps:+7.1f} | {phi_str:>7} | "
+                    f"{err:+7.1f} | {self.ctrl._integral:+7.2f} | {u:+7.3f} | {pwm_actual:5d}",
                     end="", flush=True
                 )
 
@@ -466,18 +518,22 @@ class TRMSController:
 
 def main():
     p = argparse.ArgumentParser(
-        description="TRMS — Controleur PID + gravite + slew rate limiter",
+        description="TRMS — PID encodeur 200Hz + IMU calibration/yaw",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemples :
-  python3 trms_controller.py --kp 1.5 --ki 0.20 --kd 0.4 --kg 0.25 --setpoint -20
-  python3 trms_controller.py --kp 1.5 --ki 0.10 --kd 0.4 --kg 0.25 --setpoint 6
+  python3 trms_controller.py --kp 1.5 --ki 0.10 --kd 0.05 --kg 0.25 --setpoint 10
+  python3 trms_controller.py --kp 1.5 --ki 0.10 --kd 0.05 --kg 0.0  --setpoint -20
+
+Note : Kd beaucoup plus faible qu'a 50 Hz car psi_dot est maintenant propre
+       (derivee encodeur filtree, pas de bruit gyro)
         """)
 
-    p.add_argument("--setpoint",   type=float, default=6.0)
+    p.add_argument("--setpoint",   type=float, default=10.0)
     p.add_argument("--kp",         type=float, default=1.5)
     p.add_argument("--ki",         type=float, default=0.10)
-    p.add_argument("--kd",         type=float, default=0.4)
+    p.add_argument("--kd",         type=float, default=0.05,
+                   help="Gain derive — faible car psi_dot encodeur est propre (defaut: 0.05)")
     p.add_argument("--kg",         type=float, default=0.25)
     p.add_argument("--throttle",   type=float, default=0.55)
     p.add_argument("--rest-angle", type=float, default=None,

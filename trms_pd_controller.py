@@ -15,7 +15,7 @@ from adafruit_bno08x.i2c import BNO08X_I2C
 
 ENCODER_PIN_A   = 27
 ENCODER_PIN_B   = 17
-ESC_PWM_PIN     = 18
+ESC_PWM_PIN     = 12
 
 ENCODER_CPR     = 500
 ENCODER_CPR_X4  = 2000

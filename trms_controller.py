@@ -8,7 +8,7 @@ Modes capteurs (--sensor-mode) :
   imu   : IMU seul, psi depuis quaternion, psi_dot depuis gyro
           BNO085 force a 200 Hz via interval_us=5000
           Boucle 200 Hz avec detection de nouvelle donnee IMU
-          (si pas de nouvelle donnee → skip calcul PID, pas d'accumulation integrale)
+          (si pas de lecture IMU valide → skip calcul PID ; sinon sample-and-hold)
   fused : Filtre complementaire enc+IMU (alpha=0.98)
           psi_fused = 0.98*psi_enc + 0.02*psi_imu
           psi_dot depuis encodeur filtre
@@ -31,7 +31,7 @@ import os
 import pigpio
 import board
 import busio
-from adafruit_bno08x import BNO_REPORT_ROTATION_VECTOR, BNO_REPORT_GYROSCOPE
+from adafruit_bno08x import BNO_REPORT_GAME_ROTATION_VECTOR, BNO_REPORT_GYROSCOPE
 from adafruit_bno08x.i2c import BNO08X_I2C
 
 ENCODER_PIN_A    = 27
@@ -43,8 +43,8 @@ ESC_NEUTRAL_US   = 1500
 ESC_MIN_US       = 1100
 ESC_MAX_US       = 1900
 ESC_DEADBAND_US  = 25
-ESC_SLEW_MAX_US  = 20
-ESC_DWELL_S      = 20
+ESC_SLEW_MAX_US  = 2
+ESC_DWELL_S      = 0.5
 
 CONTROL_FREQ_HZ  = 200.0
 DT               = 1.0 / CONTROL_FREQ_HZ
@@ -65,7 +65,7 @@ class IMU_BNO085:
 
     def __init__(self, need_gyro=False):
         print("[IMU]  Initialisation BNO085 sur I2C @ 0x4A...")
-        self.i2c = busio.I2C(board.SCL, board.SDA)
+        self.i2c = busio.I2C(board.SCL, board.SDA, frequency=400000)
         self.bno = BNO08X_I2C(self.i2c, address=0x4A)
         time.sleep(0.5)
         try:
@@ -75,8 +75,8 @@ class IMU_BNO085:
         time.sleep(1.0)
 
         # Force le taux de rafraichissement a IMU_INTERVAL_US
-        self._enable_feature_safe(BNO_REPORT_ROTATION_VECTOR,
-                                   interval_us=IMU_INTERVAL_US)
+        self._enable_feature_safe(BNO_REPORT_GAME_ROTATION_VECTOR,
+                          interval_us=IMU_INTERVAL_US)
         time.sleep(0.2)
         if need_gyro:
             self._enable_feature_safe(BNO_REPORT_GYROSCOPE,
@@ -87,9 +87,12 @@ class IMU_BNO085:
         self.pitch_offset = 0.0
         self.yaw_offset   = 0.0
 
-        # Etat pour la detection de nouvelle donnee
-        self._last_quat   = None
-        self._new_data    = False
+        # Etat diagnostic IMU
+        # _new_data signifie maintenant : lecture IMU valide
+        # _quat_changed signifie : quaternion numeriquement different du precedent
+        self._last_quat     = None
+        self._new_data      = False
+        self._quat_changed  = False
 
         print(f"[IMU]  BNO085 pret @ {1e6/IMU_INTERVAL_US:.0f} Hz")
 
@@ -126,22 +129,40 @@ class IMU_BNO085:
         return pitch, yaw
 
     def _get_raw(self):
+        """
+        Lecture unique du quaternion.
+
+        Important :
+        - self._new_data = True signifie maintenant qu'une lecture IMU valide
+          a ete obtenue.
+        - self._quat_changed = True signifie que le quaternion est
+          numeriquement different du precedent.
+
+        On ne confond donc plus "quaternion different" avec "nouvel
+        echantillon capteur". Cela evite de sous-estimer artificiellement
+        le refresh rate lorsque le bras est quasiment immobile.
+        """
         try:
-            quat = self.bno.quaternion
+            quat = self.bno.game_quaternion
             if quat is None:
                 self._new_data = False
+                self._quat_changed = False
                 return None, None
 
-            # Detection de nouvelle donnee : compare avec le quaternion precedent
-            if self._last_quat is not None and quat == self._last_quat:
-                self._new_data = False
+            self._new_data = True
+
+            if self._last_quat is None:
+                self._quat_changed = True
             else:
-                self._new_data = True
-                self._last_quat = quat
+                self._quat_changed = (quat != self._last_quat)
+
+            self._last_quat = quat
 
             return self._quat_to_euler(*quat)
+
         except Exception:
             self._new_data = False
+            self._quat_changed = False
             return None, None
 
     def has_new_data(self):
@@ -174,7 +195,7 @@ class IMU_BNO085:
 
     def get_rest_angle_from_vertical(self):
         """IMU orientee 180 deg / Z : pitch_offset ≈ -85 → alpha_rest = 85 deg"""
-        return -self.pitch_offset
+        return abs(self.pitch_offset)
 
     def get_psi(self):
         """psi depuis IMU, positif vers le haut. Met a jour has_new_data()."""
@@ -184,11 +205,35 @@ class IMU_BNO085:
         return pitch - self.pitch_offset
 
     def get_psi_and_new(self):
-        """Retourne (psi, is_new_data). Appel unique par iteration."""
+        """Retourne (psi, valid_data). Conserve pour compatibilite."""
         pitch, _ = self._get_raw()
         if pitch is None:
             return None, False
         return pitch - self.pitch_offset, self._new_data
+
+    def get_psi_phi_and_new(self):
+        """
+        Lecture IMU unique pour la boucle principale.
+
+        Retourne:
+            psi_imu      : pitch relatif au repos
+            phi_yaw      : yaw relatif au repos
+            valid_data   : True si une lecture quaternion valide existe
+            quat_changed : True si le quaternion differe numeriquement du precedent
+        """
+        pitch, yaw = self._get_raw()
+        if pitch is None or yaw is None:
+            return None, None, False, False
+
+        psi = -(pitch - self.pitch_offset)
+
+        phi = yaw - self.yaw_offset
+        if phi > 180.0:
+            phi -= 360.0
+        if phi < -180.0:
+            phi += 360.0
+
+        return psi, phi, self._new_data, self._quat_changed
 
     def get_psi_dot_gyro(self):
         try:
@@ -338,46 +383,42 @@ class PIDController:
         self.setpoint     = setpoint_deg
         self.rest_angle   = rest_angle_deg
         self._integral     = 0.0
-        self._integral_max = 120.0
+        self._integral_max = 400
 
     def reset_integral(self):
         self._integral = 0.0
 
     def compute(self, psi_deg, psi_dot_dps, dt_actual=None):
-        """
-        dt_actual : DT effectif de cette iteration.
-        Permet d'adapter l'integrale si la boucle saute des iterations (mode IMU).
-        """
         dt = dt_actual if dt_actual is not None else DT
         error = self.setpoint - psi_deg
-        u_p   = self.kp * error
 
-        self._integral += error * dt
-        self._integral  = max(-self._integral_max,
-                              min(self._integral_max, self._integral))
-        u_i = self.ki * self._integral
+        u_p = self.kp * error
         u_d = -self.kd * psi_dot_dps
-
         phys_angle_rad = math.radians(self.rest_angle + self.setpoint)
         u_g = self.kg * math.sin(phys_angle_rad) * 90.0
 
+        u_i_prev = self.ki * self._integral
+        u_test_norm = (u_p + u_i_prev + u_d + u_g) / 90.0
+
+        saturated_high = u_test_norm >  THROTTLE_LIMIT and error > 0
+        saturated_low  = u_test_norm < -THROTTLE_LIMIT and error < 0
+        if not (saturated_high or saturated_low):
+            self._integral += error * dt
+            self._integral = max(-self._integral_max,
+                                min(self._integral_max, self._integral))
+
+        u_i = self.ki * self._integral
         u_raw  = u_p + u_i + u_d + u_g
         u_norm = max(-THROTTLE_LIMIT, min(THROTTLE_LIMIT, u_raw / 90.0))
 
-        if abs(u_raw / 90.0) > THROTTLE_LIMIT:
-            self._integral -= error * dt
-
         return u_norm, error, u_p / 90.0, u_i / 90.0, u_d / 90.0, u_g / 90.0
-
+    
     def to_pwm(self, u_norm):
-        u_esc = -u_norm
-        if u_esc > 0:
-            pw = (ESC_NEUTRAL_US + ESC_DEADBAND_US +
-                  u_esc * (ESC_MAX_US - ESC_NEUTRAL_US - ESC_DEADBAND_US))
-        else:
-            pw = (ESC_NEUTRAL_US - ESC_DEADBAND_US +
-                  u_esc * (ESC_NEUTRAL_US - ESC_DEADBAND_US - ESC_MIN_US))
-        return int(max(ESC_MIN_US, min(ESC_MAX_US, pw)))
+        if u_norm <= 0:
+            return ESC_NEUTRAL_US
+        span = ESC_NEUTRAL_US - ESC_DEADBAND_US - ESC_MIN_US
+        pw = ESC_NEUTRAL_US - ESC_DEADBAND_US - u_norm * span
+        return int(max(ESC_MIN_US, pw))
 
 
 class TRMSController:
@@ -447,7 +488,7 @@ class TRMSController:
         )
         self.csv_file = open(self.csv_path, "w")
         self.csv_file.write(
-            "t_s,iteration,sensor_mode,new_data,"
+            "t_s,iteration,sensor_mode,new_data,quat_changed,"
             "psi_deg,psi_dot_dps,psi_enc_deg,psi_imu_deg,phi_yaw_deg,"
             "setpoint_deg,rest_angle_deg,"
             "error_deg,integral_deg_s,"
@@ -505,9 +546,10 @@ class TRMSController:
 
                 psi_enc, psi_dot_enc = self.encoder.get_psi_and_dot()
 
-                # ── Lecture IMU (toujours, pour detection new_data et logging) ──
-                psi_imu, is_new = self.imu.get_psi_and_new()
-                phi = self.imu.get_phi()
+                # ── Lecture IMU unique par iteration ──
+                # is_new = lecture IMU valide
+                # quat_changed = changement numerique du quaternion, diagnostic uniquement
+                psi_imu, phi, is_new, quat_changed = self.imu.get_psi_phi_and_new()
 
                 # ── Selection source selon mode ──
                 if self.sensor_mode == "enc":
@@ -517,8 +559,8 @@ class TRMSController:
                     dt_pid   = DT
 
                 elif self.sensor_mode == "imu":
-                    if psi_imu is None or not is_new:
-                        # Pas de nouvelle donnee → maintient le dernier PWM,
+                    if psi_imu is None:
+                        # Pas de lecture IMU valide → maintient le dernier PWM,
                         # ne recalcule pas le PID, n'accumule pas l'integrale
                         imu_skip_count += 1
                         self.esc.set_pwm(last_pwm)
@@ -556,7 +598,7 @@ class TRMSController:
                 phi_log    = str(round(phi, 4))    if phi    is not None else ""
 
                 self.csv_file.write(
-                    f"{t_elapsed:.4f},{it},{self.sensor_mode},{int(is_new)},"
+                    f"{t_elapsed:.4f},{it},{self.sensor_mode},{int(is_new)},{int(quat_changed)},"
                     f"{psi:.4f},{psi_dot:.4f},{psi_enc:.4f},{imu_log},{phi_log},"
                     f"{self.ctrl.setpoint:.2f},{self.ctrl.rest_angle:.2f},"
                     f"{err:.4f},{self.ctrl._integral:.4f},"
@@ -564,7 +606,7 @@ class TRMSController:
                 )
 
                 imu_str  = f"{psi_imu:+7.1f}" if psi_imu is not None else "   N/A"
-                new_str  = "NEW" if is_new else "---"
+                new_str  = "OK" if is_new else "---"
                 print(
                     f"\r{it:6d} | {psi:+7.1f} | {psi_enc:+7.1f} | {imu_str} | "
                     f"{psi_dot:+7.1f} | {err:+7.1f} | {self.ctrl._integral:+7.2f} | "
@@ -582,9 +624,9 @@ class TRMSController:
         finally:
             if self.sensor_mode == "imu" and (imu_new_count + imu_skip_count) > 0:
                 total = imu_new_count + imu_skip_count
-                print(f"\n[IMU]  Nouvelles donnees : {imu_new_count}/{total} "
+                print(f"\n[IMU]  Lectures IMU valides : {imu_new_count}/{total} "
                       f"({100*imu_new_count/total:.0f}%) "
-                      f"→ taux effectif ~{imu_new_count/max(1,t0-t_start):.0f} Hz")
+                      f"→ taux lecture valide ~{imu_new_count/max(1,t0-t_start):.0f} Hz")
             self._cleanup()
 
     def _cleanup(self):

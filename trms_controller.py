@@ -43,7 +43,7 @@ ESC_NEUTRAL_US   = 1500
 ESC_MIN_US       = 1100
 ESC_MAX_US       = 1900
 ESC_DEADBAND_US  = 25
-ESC_SLEW_MAX_US  = 2
+ESC_SLEW_MAX_US  = 1
 ESC_DWELL_S      = 0.5
 
 CONTROL_FREQ_HZ  = 200.0
@@ -383,7 +383,7 @@ class PIDController:
         self.setpoint     = setpoint_deg
         self.rest_angle   = rest_angle_deg
         self._integral     = 0.0
-        self._integral_max = 400
+        self._integral_max = 90
 
     def reset_integral(self):
         self._integral = 0.0

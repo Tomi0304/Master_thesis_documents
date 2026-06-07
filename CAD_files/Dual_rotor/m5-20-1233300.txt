@@ -1,0 +1,13 @@
+﻿"Symbol";"Value";"Unit";
+"TraceParts.PartNumber";"34-04042013-122015";"";
+"REFERENCE";"1233300";"";
+"STANDARD";"DIN 912, ISO 4762, UNI 5931";"";
+"TraceParts.PartTitle";"BN 610 - DIN 912 - ISO 4762 Hex socket head cap screws fully threaded";"";
+"TraceParts.InstanceId";"34-04042013-122015E8GDWCTA4V3FV0C740BWRW4XU";"";
+"TraceParts.PartLanguage";"en";"";
+"NOTE";"Quality A2";"";
+"SUPPLIER";"BOSSARD";"";
+"DESIGN";"BN 610 - DIN 912 - ISO 4762 Hex socket head cap screws fully threaded";"";
+"TRACEPARTS";"TRACEPARTS";"";
+"MATERIAL";"Stainless steel";"";
+"TraceParts.PartVersion";"1.2.0";"";

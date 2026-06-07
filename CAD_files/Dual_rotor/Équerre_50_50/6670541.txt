@@ -1,0 +1,16 @@
+﻿"Symbol";"Value";"Unit";
+"SUPPLIER_NAME";"RS Components";"";
+"TraceParts.PartVersion";"1.0.0";"";
+"SUPPLIER";"Bosch Rexroth";"";
+"TraceParts.PartStatus";"Published";"";
+"TraceParts.PartNumber";"90-07032024-042401";"";
+"TraceParts.PartLanguage";"en";"";
+"DESIGN";"50";"";
+"TraceParts.InstanceId";"90-07032024-0424012N3XX9WWY2MK673V115V3T3RA";"";
+"TraceParts.PartTitle";"50";"";
+"url";"https://uk.rs-online.com/web/p/connecting-components/6670541//?cm_mmc=aff-_-uk-_-traceparts-_-6670541";"";
+"REFERENCE";"3 842 530 381";"";
+"TRACEPARTS";"TRACEPARTS";"";
+"TraceParts.PartStatusId";"";"";
+"rs_stock_number";"6670541";"";
+"TraceParts.ClassPath";"RS_COMPONENTS:90-07032024-042401";"";

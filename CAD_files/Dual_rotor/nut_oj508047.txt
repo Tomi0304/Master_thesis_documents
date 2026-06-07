@@ -1,0 +1,12 @@
+﻿"Symbol";"Value";"Unit";
+"TraceParts.PartNumber";"33-20092023-051361";"";
+"REFERENCE";"OJ508047";"";
+"PRODUCT_CODE";"NITMS05 000";"";
+"SIZE";"M5 x 0.80";"";
+"TraceParts.PartTitle";"Class 6 Nylon Insert Nuts T Type DIN 985 BZP";"";
+"SUPPLIER";"Owlett-Jaton";"";
+"DESIGN";"Class 6 Nylon Insert Nuts T Type DIN 985 BZP - M5 x 0.80";"";
+"TraceParts.InstanceId";"33-20092023-0513616U2UOJNFDEKAC6G42YNKPQZ4A";"";
+"TRACEPARTS";"TRACEPARTS";"";
+"TraceParts.PartLanguage";"en";"";
+"TraceParts.PartVersion";"1.0.8";"";

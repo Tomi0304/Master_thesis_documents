@@ -1,0 +1,15 @@
+﻿"Symbol";"Value";"Unit";
+"REFERENCE";"4838130";"";
+"TraceParts.PartVersion";"1.0.4";"";
+"SUPPLIER";"RS PRO";"";
+"TraceParts.PartStatus";"Published";"";
+"TraceParts.PartNumber";"90-27102023-079730";"";
+"TraceParts.PartLanguage";"en";"";
+"DESIGN";"BZP CAP SCREW,M2.5X12";"";
+"TraceParts.InstanceId";"90-27102023-07973078P2ST6ENTHNY6M228NL8S6AD";"";
+"TraceParts.PartTitle";"BZP CAP SCREW,M2.5X12";"";
+"url";"https://uk.rs-online.com/web/p/products/4838130//?cm_mmc=aff-_-uk-_-traceparts-_-4838130'";"";
+"TRACEPARTS";"TRACEPARTS";"";
+"TraceParts.PartStatusId";"";"";
+"rs_stock_number";"4838130";"";
+"TraceParts.ClassPath";"RS_COMPONENTS:90-27102023-079730";"";

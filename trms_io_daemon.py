@@ -69,6 +69,24 @@ IMU_DIV = 2
 
 IMU_ENABLE_GYRO = True
 
+# Interval between sensor reports, in microseconds. The Adafruit library
+# defaults to 50000 us (20 Hz), which caps the freshness of the whole chain no
+# matter how fast the loop polls. 10000 us gives 100 Hz. Going faster loads the
+# bit-banged bus and raises the malformed-batch rate, so check CPU after a
+# change: top -bn1 | grep python3
+IMU_REPORT_INTERVAL_US = 10000
+
+# The BCM2711 hardware I2C controller aborts transfers when the BNO085 stretches
+# the clock, surfacing as OSError errno 5. The fix is a bit-banged bus, which
+# polls the line every cycle and waits properly:
+#   #dtparam=i2c_arm=on
+#   dtoverlay=i2c-gpio,bus=1,i2c_gpio_sda=2,i2c_gpio_scl=3
+# Giving it bus number 1 lets Blinka find it on board.SCL / board.SDA exactly as
+# it found the hardware bus, so leave I2C_BUS at None. Set it to a bus number
+# only if the software bus is created under a different number, which requires
+# adafruit-extended-bus and is rejected by some Blinka versions.
+I2C_BUS = None
+
 QUAD_LUT = (0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0)
 
 
@@ -173,8 +191,6 @@ class IMU:
 
     def _connect(self):
         try:
-            import board
-            import busio
             from adafruit_bno08x import (
                 BNO_REPORT_GAME_ROTATION_VECTOR,
                 BNO_REPORT_GYROSCOPE,
@@ -183,11 +199,22 @@ class IMU:
 
             patch_bno08x_batch_fault()
 
-            i2c = busio.I2C(board.SCL, board.SDA)
+            if I2C_BUS is None:
+                import board
+                import busio
+
+                i2c = busio.I2C(board.SCL, board.SDA)
+            else:
+                from adafruit_extended_bus import ExtendedI2C
+
+                i2c = ExtendedI2C(I2C_BUS)
+
             dev = BNO08X_I2C(i2c)
-            dev.enable_feature(BNO_REPORT_GAME_ROTATION_VECTOR)
+            dev.enable_feature(
+                BNO_REPORT_GAME_ROTATION_VECTOR, IMU_REPORT_INTERVAL_US
+            )
             if IMU_ENABLE_GYRO:
-                dev.enable_feature(BNO_REPORT_GYROSCOPE)
+                dev.enable_feature(BNO_REPORT_GYROSCOPE, IMU_REPORT_INTERVAL_US)
             with self._lock:
                 self._dev = dev
                 self.ok = True

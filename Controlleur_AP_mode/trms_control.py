@@ -9,68 +9,52 @@ import pigpio
 from adafruit_bno08x import BNO_REPORT_GAME_ROTATION_VECTOR, BNO_REPORT_GYROSCOPE
 from adafruit_bno08x.i2c import BNO08X_I2C
 
-GPIO_MAIN = 12
-GPIO_TAIL = 13
+GPIO = 12
 FREQ = 50
 TS = 1.0 / FREQ
 
-PWM_NEUTRAL = 1500
-PWM_KICK_STRONG = 110
-PWM_KICK_WEAK = 145
-PWM_MIN_STRONG = 70
-PWM_MIN_WEAK = 35
-PWM_MAX_STRONG = 400
-PWM_MAX_WEAK = 400
+NEUTRAL = 1500
+OFF_MIN_S = 70
+OFF_MIN_W = 35
+OFF_MAX = 390
+OFF_KICK = 130
+T_KICK = 0.35
 SLEW = 1250.0
 
-T_KICK_STRONG = 0.20
-T_KICK_WEAK = 0.20
-T_DWELL = 0.15
-U_MIN = 0.04
-U_START = 0.25
-T_COAST_FREE = 0.60
-U_REV = 0.35
-MAX_REV = 4
+U_REV = 2.0
 
-KP_STRONG = 1.4
-KI_STRONG = 0.6
-KD_STRONG = 1.5
+KP_S = 1.4
+KI_S = 0.6
+KD_S = 1.5
 
-KP_WEAK = 4.0
-KI_WEAK = 0.30
-KD_WEAK = 1.2
+ALPHA_W = 2.86
+KP_W = KP_S * ALPHA_W
+KI_W = KI_S * ALPHA_W
+KD_W = KD_S * ALPHA_W
+
 ALPHA_D = 0.6
 I_MAX = 0.5
-I_BAND_DEG = 40.0
+
+REF_SEQUENCE = [(3.0, 0.0), (15.0, 90.0), (10.0, 0.0)]
+REF_RATE = 55.0
+
+MAP_STEPS = [(12.0, 70), (12.0, 100), (12.0, 110), (12.0, 120),
+             (12.0, 128), (12.0, 136), (12.0, 144)]
+MAP_SETTLE = 4.0
 
 ANGLE_AXIS = 2
 ANGLE_SIGN = 1.0
-REF_SEQUENCE = [(2.0, 0.0), (10.0, 90.0)]
-
-ERR_DEAD = 4.0
-RATE_DEAD = 0.4
-KILL_PWM_ON_EXIT = False
 ANGLE_MAX = 140.0
+ANGLE_MIN = -12.0
+ANGLE_STOP = 78.0
 RATE_MAX = 8.0
-STALL_TIME = 0.60
+REV_MAX_RATE = 6.0
 
 ZERO_WARMUP = 4.0
 ZERO_SAMPLES = 40
 ZERO_TIMEOUT = 25.0
 ZERO_STILL = 0.03
 ZERO_SPREAD = 1.5
-
-
-def circ_mean(v):
-    s = sum(math.sin(math.radians(x)) for x in v)
-    c = sum(math.cos(math.radians(x)) for x in v)
-    return math.degrees(math.atan2(s, c))
-
-
-def circ_spread(v):
-    m = circ_mean(v)
-    d = [(x - m + 180.0) % 360.0 - 180.0 for x in v]
-    return max(d) - min(d)
 
 
 class Imu:
@@ -90,21 +74,17 @@ class Imu:
 
     def read(self):
         try:
-            quat = self.bno.game_quaternion
-            gyro = self.bno.gyro
+            quat, gyro = self.bno.game_quaternion, self.bno.gyro
             if quat is None or gyro is None:
                 self.ok = False
                 return self.last
             x, y, z, w = quat
             g = [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]
-            tilt = [
-                math.degrees(math.atan2(g[1], g[2])),
-                math.degrees(math.atan2(g[0], g[2])),
-                math.degrees(math.atan2(g[0], g[1])),
-            ]
+            tilt = [math.degrees(math.atan2(g[1], g[2])),
+                    math.degrees(math.atan2(g[0], g[2])),
+                    math.degrees(math.atan2(g[0], g[1]))]
             a = ANGLE_SIGN * tilt[ANGLE_AXIS] - self.offset
-            a = (a + 180.0) % 360.0 - 180.0
-            self.last = (a, tilt, list(gyro))
+            self.last = ((a + 180.0) % 360.0 - 180.0, tilt, list(gyro))
             self.ok = True
         except Exception:
             self.ok = False
@@ -127,184 +107,94 @@ class Imu:
                 acc.clear()
             else:
                 acc.append(a)
-                if circ_spread(acc) > ZERO_SPREAD:
+                if max(acc) - min(acc) > ZERO_SPREAD:
                     acc = [a]
                 best = max(best, len(acc))
             time.sleep(0.02)
         if len(acc) < ZERO_SAMPLES:
-            raise RuntimeError(
-                f"calibration impossible: au mieux {best}/{ZERO_SAMPLES} "
-                f"echantillons stables -- bras immobile ? vibrations ?"
-            )
-        self.offset = circ_mean(acc)
-        return self.offset, circ_spread(acc)
+            raise RuntimeError(f"calibration impossible: {best}/{ZERO_SAMPLES} "
+                               f"echantillons stables -- bras immobile ?")
+        self.offset = sum(acc) / len(acc)
+        return self.offset, max(acc) - min(acc)
 
 
-class Pid:
-    def __init__(self):
-        self.p = self.i = self.d = 0.0
-
-    def reset(self):
-        self.p = self.i = self.d = 0.0
-
-    def step(self, err, rate, dt, hold):
-        strong = err > 0.0
-        kp = KP_STRONG if strong else KP_WEAK
-        ki = KI_STRONG if strong else KI_WEAK
-        kd = KD_STRONG if strong else KD_WEAK
-        self.p = kp * err
-        if abs(err) > math.radians(I_BAND_DEG):
-            self.i = 0.0
-        elif not hold:
-            self.i = max(-I_MAX, min(I_MAX, self.i + err * dt))
-        self.d = ALPHA_D * (-rate) + (1.0 - ALPHA_D) * self.d
-        return self.p + ki * self.i + kd * self.d
-
-
-class Esc:
-    def __init__(self, pi, gpio):
-        self.pi, self.gpio = pi, gpio
-        self.pwm = PWM_NEUTRAL
-        self.state = "idle"
-        self.dir = 0
-        self.last_dir = 0
-        self.timer = 0.0
+class Motor:
+    def __init__(self, pi):
+        self.pi = pi
+        self.pwm = NEUTRAL
+        self.dir = 1
+        self.held = False
         self.revs = 0
 
-    def _write(self, us):
+    def write(self, us):
         self.pwm = us
-        self.pi.hardware_PWM(self.gpio, FREQ, int(us * FREQ))
+        self.pi.hardware_PWM(GPIO, FREQ, int(us * FREQ))
         return us
 
-    def release(self):
-        self.state, self.dir, self.timer = "idle", 0, 0.0
-        return self._write(PWM_NEUTRAL)
+    def stop(self):
+        return self.write(NEUTRAL)
 
-    def new_setpoint(self):
-        self.revs = 0
+    def kick(self):
+        self.write(NEUTRAL - OFF_KICK)
+        time.sleep(T_KICK)
+        return self.write(NEUTRAL - OFF_MIN_S)
 
-    def _engage(self, d):
-        self.dir = self.last_dir = d
-        self.state, self.timer = "kick", 0.0
+    def command(self, u):
+        want = 1 if u >= 0.0 else -1
+        if want != self.dir and abs(u) >= U_REV:
+            self.dir = want
+            self.revs += 1
+        self.held = want != self.dir
+        mag = 0.0 if self.held else min(1.0, abs(u))
+        floor = OFF_MIN_S if self.dir > 0 else OFF_MIN_W
+        off = floor + mag * (OFF_MAX - floor)
+        target = NEUTRAL - self.dir * off
+        step = SLEW * TS
+        return self.write(self.pwm + max(-step, min(step, target - self.pwm)))
 
-    def update(self, u, dt):
-        self.timer += dt
-        mag = abs(u)
-        want = 1 if u > 0.0 else -1
-
-        if self.state == "dwell":
-            if self.timer < T_DWELL:
-                return self._write(PWM_NEUTRAL)
-            self.state, self.timer = "kick", 0.0
-
-        elif mag < U_MIN:
-            if self.state != "idle":
-                self.state, self.dir, self.timer = "idle", 0, 0.0
-            elif self.timer > T_COAST_FREE:
-                self.last_dir, self.revs = 0, 0
-            return self._write(PWM_NEUTRAL)
-
-        elif self.last_dir != 0 and want != self.last_dir:
-            if mag > U_REV and self.revs < MAX_REV:
-                self.revs += 1
-                self.dir = self.last_dir = want
-                self.state, self.timer = "dwell", 0.0
-            elif self.state != "idle":
-                self.state, self.dir, self.timer = "idle", 0, 0.0
-            elif self.timer > T_COAST_FREE:
-                self.last_dir, self.revs = 0, 0
-            return self._write(PWM_NEUTRAL)
-
-        elif self.state == "idle":
-            if mag < U_START:
-                return self._write(PWM_NEUTRAL)
-            self._engage(want)
-
-        strong = self.dir > 0
-        if self.state == "kick":
-            hold = T_KICK_STRONG if strong else T_KICK_WEAK
-            if self.timer < hold:
-                kick = PWM_KICK_STRONG if strong else PWM_KICK_WEAK
-                return self._write(PWM_NEUTRAL - self.dir * kick)
-            self.state = "run"
-
-        floor = PWM_MIN_STRONG if strong else PWM_MIN_WEAK
-        top = PWM_MAX_STRONG if strong else PWM_MAX_WEAK
-        off = floor + min(1.0, mag) * (top - floor)
-        target = PWM_NEUTRAL - self.dir * off
-        step = SLEW * dt
-        return self._write(self.pwm + max(-step, min(step, target - self.pwm)))
+    def offset(self, off):
+        self.dir, self.held = 1, False
+        target = NEUTRAL - max(OFF_MIN_S, min(OFF_MAX, off))
+        step = SLEW * TS
+        return self.write(self.pwm + max(-step, min(step, target - self.pwm)))
 
 
-def ref_at(t):
+def sched(t, table):
     acc = 0.0
-    for dur, r in REF_SEQUENCE:
+    for dur, v in table:
         acc += dur
         if t < acc:
-            return r
-    return REF_SEQUENCE[-1][1]
+            return v
+    return table[-1][1]
 
 
-def check(imu):
-    print("calibration -- ne touche pas au bras")
-    off, spread = imu.zero()
-    print(f"zero = {off:+.2f} deg (dispersion {spread:.2f})")
-    print("bouge le bras a la main. Ctrl-C pour sortir.")
-    print("  angle  |  tilt_x   tilt_y   tilt_z  |    gx      gy      gz")
-    try:
-        while True:
-            a, tilt, g = imu.read()
-            print(
-                f"\r{a:+8.2f} |{tilt[0]:+9.1f}{tilt[1]:+9.1f}{tilt[2]:+9.1f} "
-                f"|{g[0]:+8.3f}{g[1]:+8.3f}{g[2]:+8.3f}   ",
-                end="", flush=True,
-            )
-            time.sleep(0.1)
-    except KeyboardInterrupt:
-        print()
-
-
-def control(pi, imu, path):
-    pid, esc = Pid(), Esc(pi, GPIO_MAIN)
-    total = sum(d for d, _ in REF_SEQUENCE)
-    rows, stall, prev_ref, status = [], 0.0, None, "ok"
-
+def calibrate(imu):
     print("calibration -- ne touche pas au bras")
     off, spread = imu.zero()
     print(f"zero = {off:+.2f} deg (dispersion {spread:.2f})")
 
+
+def loop(imu, motor, total, body, header, path, amax=ANGLE_MAX):
+    rows, status = [], "ok"
+    calibrate(imu)
+    motor.kick()
     t0 = time.perf_counter()
     k = 0
     while True:
         now = time.perf_counter() - t0
         if now >= total:
             break
-
         angle, _, gyro = imu.read()
-        rate = imu.rate()
-        if abs(angle) > ANGLE_MAX or max(abs(v) for v in gyro) > RATE_MAX:
-            status = f"ABORT angle {angle:+.1f} deg, rate {rate:+.2f} rad/s"
+        if angle > amax or angle < ANGLE_MIN:
+            status = f"ABORT angle {angle:+.1f} deg"
             break
-
-        ref = ref_at(now)
-        if ref != prev_ref:
-            prev_ref = ref
-            esc.new_setpoint()
-            pid.reset()
-
-        err = ref - angle
-        hold = abs(err) < ERR_DEAD and abs(rate) < RATE_DEAD
-        u = 0.0 if hold else pid.step(math.radians(err), rate, TS, hold)
-        pwm = esc.update(u, TS)
-
-        moving = abs(rate) > 0.05
-        stall = 0.0 if moving or esc.state != "run" or abs(u) < 0.4 else stall + TS
-        if stall > STALL_TIME:
-            status = f"ABORT stall: |u|={abs(u):.2f} sans mouvement"
+        if max(abs(v) for v in gyro) > RATE_MAX:
+            status = f"ABORT rate {imu.rate():+.2f} rad/s"
             break
-
-        rows.append((now, ref, angle, err, u, pwm, esc.state,
-                     pid.p, pid.i, pid.d, rate))
+        if now > 2.0 and motor.revs / now > REV_MAX_RATE:
+            status = f"ABORT {motor.revs} renversements en {now:.1f} s"
+            break
+        rows.append(body(now, angle, imu.rate()))
         k += 1
         deadline = t0 + k * TS
         rem = deadline - time.perf_counter()
@@ -312,41 +202,116 @@ def control(pi, imu, path):
             time.sleep(rem - 0.001)
         while time.perf_counter() < deadline:
             pass
-
-    esc.release()
+    motor.stop()
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(("t", "ref", "angle", "err", "u", "pwm", "state",
-                    "P", "I", "D", "gz"))
+        w.writerow(header)
         w.writerows(rows)
-    late = [abs(r[3]) for r in rows[int(2 * FREQ):]] or [0.0]
-    print(f"{status} | {len(rows)} samples | |err| moyen {sum(late)/len(late):.2f} deg "
-          f"| {esc.revs} renversement(s) | -> {path}")
+    print(f"{status} | {len(rows)} samples -> {path}")
+    return rows
+
+
+def control(imu, motor, path):
+    st = {"i": 0.0, "d": 0.0, "tgt": None, "ref": 0.0}
+
+    def body(now, angle, rate):
+        tgt = sched(now, REF_SEQUENCE)
+        if tgt != st["tgt"]:
+            st["tgt"], st["i"], st["d"] = tgt, 0.0, 0.0
+        step = REF_RATE * TS
+        st["ref"] += max(-step, min(step, tgt - st["ref"]))
+        ref = st["ref"]
+        err = math.radians(ref - angle)
+
+        strong = motor.dir > 0
+        kp = KP_S if strong else KP_W
+        ki = KI_S if strong else KI_W
+        kd = KD_S if strong else KD_W
+
+        st["d"] = ALPHA_D * (-rate) + (1.0 - ALPHA_D) * st["d"]
+        u = kp * err + ki * st["i"] + kd * st["d"]
+        grow = (u >= 1.0 and err > 0.0) or (u <= -1.0 and err < 0.0)
+        if not motor.held and not grow:
+            st["i"] = max(-I_MAX, min(I_MAX, st["i"] + err * TS))
+
+        pwm = motor.command(u)
+        return (time.time(), now, tgt, ref, angle, math.degrees(err), u, pwm,
+                motor.dir, int(motor.held), kp * err, ki * st["i"], kd * st["d"], rate)
+
+    total = sum(d for d, _ in REF_SEQUENCE)
+    rows = loop(imu, motor, total, body,
+                ("wall", "t", "tgt", "ref", "angle", "err", "u", "pwm",
+                 "dir", "held", "P", "I", "D", "gz"), path)
+    if not rows:
+        return
+    late = [abs(r[5]) for r in rows[5 * FREQ:]] or [0.0]
+    held = sum(r[9] for r in rows) * TS
+    print(f"|err| moyen apres 5 s : {sum(late)/len(late):.2f} deg")
+    print(f"{motor.revs} renversement(s) | plancher tenu {held:.2f} s "
+          f"({100*held/(len(rows)*TS):.0f} %)")
+
+
+def sweep(imu, motor, path):
+    def body(now, angle, rate):
+        off = sched(now, MAP_STEPS)
+        return (time.time(), now, off, motor.offset(off), angle, rate)
+
+    total = sum(d for d, _ in MAP_STEPS)
+    print(f"balayage {total:.0f} s, {len(MAP_STEPS)} paliers, garde a {ANGLE_STOP:.0f} deg")
+    rows = loop(imu, motor, total, body,
+                ("wall", "t", "offset", "pwm", "angle", "gz"), path, amax=ANGLE_STOP)
+    if not rows:
+        return
+    print(" offset |   psi_eq |  spread |   sin  | fenetre unix")
+    acc = 0.0
+    for dur, o in MAP_STEPS:
+        seg = [r for r in rows if acc + dur - MAP_SETTLE <= r[1] < acc + dur]
+        acc += dur
+        if not seg:
+            continue
+        ang = [r[4] for r in seg]
+        m = sum(ang) / len(ang)
+        sp = max(ang) - min(ang)
+        flag = "" if sp < 1.5 else "  <-- non stabilise"
+        print(f" {o:6d} | {m:+8.2f} | {sp:7.2f} | {math.sin(math.radians(m)):+6.3f} "
+              f"| {seg[0][0]:.1f} - {seg[-1][0]:.1f}{flag}")
+
+
+def check(imu):
+    calibrate(imu)
+    print("bouge le bras a la main. Ctrl-C pour sortir.")
+    try:
+        while True:
+            a, tilt, g = imu.read()
+            print(f"\r{a:+8.2f} |{tilt[0]:+9.1f}{tilt[1]:+9.1f}{tilt[2]:+9.1f} "
+                  f"|{g[0]:+8.3f}{g[1]:+8.3f}{g[2]:+8.3f}   ", end="", flush=True)
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print()
 
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "check"
+    if mode not in ("check", "map", "ctrl"):
+        return print("usage: check | map | ctrl")
     imu = Imu()
     if mode == "check":
         return check(imu)
-
     pi = pigpio.pi()
     if not pi.connected:
         return print("pigpiod unreachable")
-    main_esc, tail_esc = Esc(pi, GPIO_MAIN), Esc(pi, GPIO_TAIL)
+    motor = Motor(pi)
     try:
-        main_esc.release()
-        tail_esc.release()
+        motor.stop()
         time.sleep(3.0)
-        input("armed. Enter pour lancer la boucle, Ctrl-C pour annuler ")
-        control(pi, imu, f"ctrl_ap_{time.strftime('%H%M%S')}.csv")
+        print(f"fort  KP={KP_S} KI={KI_S} KD={KD_S}   "
+              f"faible KP={KP_W} KI={KI_W} KD={KD_W}   U_REV={U_REV}")
+        input("armed. Enter pour lancer, Ctrl-C pour annuler ")
+        run = sweep if mode == "map" else control
+        run(imu, motor, f"{mode}bi_ap_{time.strftime('%H%M%S')}.csv")
     finally:
-        main_esc.release()
-        tail_esc.release()
+        motor.stop()
         time.sleep(0.5)
-        if KILL_PWM_ON_EXIT:
-            pi.hardware_PWM(GPIO_MAIN, 0, 0)
-            pi.hardware_PWM(GPIO_TAIL, 0, 0)
         pi.stop()
 
 

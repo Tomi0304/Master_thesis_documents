@@ -266,9 +266,13 @@ class IMU:
         gx, gy, gz = gyro
 
         sinp = 2.0 * (qw * qy - qz * qx)
-        sinp = max(-1.0, min(1.0, sinp))
+        cosp = 1.0 - 2.0 * (qx * qx + qy * qy)
 
-        self.pitch = math.degrees(math.asin(sinp))
+        # atan2 on the gravity vector rather than asin on one component. asin is
+        # bounded to +-90 deg, so a beam driven past the vertical reads as
+        # descending while it is still rising: the loop sign flips and the
+        # controller drives it round. atan2 covers the full +-180 deg.
+        self.pitch = math.degrees(math.atan2(sinp, cosp))
         self.yaw = math.degrees(
             math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
         )

@@ -18,10 +18,10 @@ import serial
 PORT = "/dev/ttyGS0"
 BAUD = 921600
 
-ACQ_HZ = 200.0
+ACQ_HZ = 50.0
 ACQ_DT = 1.0 / ACQ_HZ
 
-HOST_DIV = 4
+HOST_DIV = 1
 HOST_HZ = ACQ_HZ / HOST_DIV
 PACE_ON_TICK = True
 
@@ -42,8 +42,23 @@ PWM_MAX = PWM_NEUTRAL + PWM_SPAN
 PWM_DEADBAND = 25
 SLEW_US_PER_S = 3000.0
 
-PITCH_LIMIT_DEG = 140.0
+# The pitch axis has no mechanical stop, so this limit is the only thing that
+# stops the beam going over the top. It was previously 140 deg, which the old
+# Euler projection could never reach because that projection saturated near
+# 110 deg: the interlock was inert. With the pivot projection the angle is a
+# true angle, so set a value that means something.
+PITCH_LIMIT_DEG = 110.0
 YAW_LIMIT_DEG = 65.0
+
+# Back the pitch limit with the IMU as well as the encoder. Set False only if a
+# pitch encoder is wired and trusted on its own.
+IMU_PITCH_LIMIT = True
+
+# Unwired encoder inputs float on their pull-ups and pick up edges from the
+# motors, so their counters drift and trip the angle limit with no encoder
+# present. Set each flag True only once that encoder is actually wired.
+ENC_PITCH_PRESENT = False
+ENC_YAW_PRESENT = False
 
 MAGIC0, MAGIC1 = 0xA5, 0x5A
 CMD_FMT = "<BBBBBBhhH"
@@ -58,6 +73,26 @@ ST_IMU_OK = 0x08
 ST_CRC_ERR = 0x10
 ST_SLEW = 0x20
 ST_UNDERVOLT = 0x40
+ST_NOZERO = 0x80
+
+# The BNO085 zero depends on the orientation in which it initialised, so the
+# raw pitch is meaningless as an absolute angle. Take the arm's resting
+# position as zero: average the first ZERO_N samples once they hold within
+# ZERO_SPREAD_DEG, which requires the arm to be still at startup.
+ZERO_N = 40
+ZERO_SPREAD_DEG = 1.5
+
+# Re-acquire the zero whenever the bench has been disarmed and motionless for
+# AUTO_REZERO_S. The arm at rest is the reference by definition, so each run
+# starts from a fresh zero without restarting the daemon. Set False to keep the
+# single zero taken at startup.
+AUTO_REZERO = True
+AUTO_REZERO_S = 2.0
+AUTO_REZERO_RATE = 3.0
+# Only re-zero if the arm has come back within this of the current zero. Without
+# it, any pause while handling the arm redefines the reference wherever it
+# happens to be. Also fires at most once per disarm.
+AUTO_REZERO_BAND = 25.0
 
 UNDERVOLT_GLOB = "/sys/class/hwmon/hwmon*/in0_lcrit_alarm"
 UNDERVOLT_PERIOD = 100
@@ -86,6 +121,27 @@ IMU_REPORT_INTERVAL_US = 10000
 # only if the software bus is created under a different number, which requires
 # adafruit-extended-bus and is rejected by some Blinka versions.
 I2C_BUS = None
+
+# --- Pitch pivot axis, identified by calib_pivot.py ------------------------
+# The arm turns about a fixed axis, so in the sensor frame the world vertical
+# sweeps a circle whose normal is that axis. PIVOT_N is that normal, PIVOT_E1
+# and PIVOT_E2 an orthonormal basis of the circle's plane, and PIVOT_SIGN
+# orients the result so that raising the main-rotor side reads positive.
+#
+# This replaces the Euler pitch, which assumed the pivot ran along the IMU y
+# axis. On this bench the pivot is 89.5 deg away from y and 0.4 deg from z, so
+# that projection sat in permanent near-gimbal-lock: its error was nonlinear,
+# it saturated around 110 deg, and no scale factor could correct it.
+#
+# Rerun calib_pivot.py whenever the IMU or its bracket is disturbed.
+PIVOT_N = (+0.001386, +0.007480, +0.999971)
+PIVOT_E1 = (-0.024372, +0.999675, -0.007444)
+PIVOT_E2 = (-0.999702, -0.024361, +0.001568)
+PIVOT_SIGN = -1.0
+
+# Out-of-plane drift, in the units of the unit gravity vector, beyond which the
+# calibration is reported as stale. 0.02 is roughly 1 deg of axis movement.
+PIVOT_DRIFT_WARN = 0.02
 
 QUAD_LUT = (0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0)
 
@@ -187,6 +243,17 @@ class IMU:
         self._lock = threading.Lock()
         self._resetting = False
         self.resets = 0
+        self.offset = 0.0
+        self.yaw_offset = 0.0
+        self._pending_yaw = 0.0
+        self.zeroed = False
+        self._zero_buf = []
+        self._yaw_buf = []
+        # Out-of-plane component of the gravity vector. Constant by
+        # construction, so any change means the IMU bracket has moved and the
+        # pivot calibration no longer describes the bench.
+        self.resid = 0.0
+        self.resid_ref = None
         self._connect()
 
     def _connect(self):
@@ -224,6 +291,13 @@ class IMU:
                 self._dev = None
                 self.ok = False
 
+    def request_zero(self):
+        with self._lock:
+            if not self.zeroed:
+                return
+            self.zeroed = False
+            self._zero_buf = []
+
     def _schedule_reset(self):
         with self._lock:
             if self._resetting:
@@ -231,6 +305,9 @@ class IMU:
             self._resetting = True
             self._dev = None
             self.ok = False
+            self.zeroed = False
+            self._zero_buf = []
+            self._yaw_buf = []
             self.resets += 1
 
         def worker():
@@ -265,18 +342,66 @@ class IMU:
             return
         gx, gy, gz = gyro
 
-        sinp = 2.0 * (qw * qy - qz * qx)
-        cosp = 1.0 - 2.0 * (qx * qx + qy * qy)
+        # World vertical expressed in the sensor frame: the third row of R(q).
+        # This is the only part of the Game Rotation Vector with an absolute
+        # reference, since it comes from the accelerometer.
+        v0 = 2.0 * (qx * qz - qw * qy)
+        v1 = 2.0 * (qy * qz + qw * qx)
+        v2 = 1.0 - 2.0 * (qx * qx + qy * qy)
 
-        # atan2 on the gravity vector rather than asin on one component. asin is
-        # bounded to +-90 deg, so a beam driven past the vertical reads as
-        # descending while it is still rising: the loop sign flips and the
-        # controller drives it round. atan2 covers the full +-180 deg.
-        self.pitch = math.degrees(math.atan2(sinp, cosp))
-        self.yaw = math.degrees(
+        # Project onto the calibrated plane of the pivot. Linear over the full
+        # +-180 deg and independent of how the IMU is mounted, where the Euler
+        # pitch it replaces was neither.
+        p1 = v0 * PIVOT_E1[0] + v1 * PIVOT_E1[1] + v2 * PIVOT_E1[2]
+        p2 = v0 * PIVOT_E2[0] + v1 * PIVOT_E2[1] + v2 * PIVOT_E2[2]
+        raw_pitch = PIVOT_SIGN * math.degrees(math.atan2(p2, p1))
+
+        self.resid = v0 * PIVOT_N[0] + v1 * PIVOT_N[1] + v2 * PIVOT_N[2]
+
+        if not self.zeroed:
+            self._zero_buf.append(raw_pitch)
+            if len(self._zero_buf) > ZERO_N:
+                self._zero_buf.pop(0)
+            if len(self._zero_buf) == ZERO_N:
+                spread = max(self._zero_buf) - min(self._zero_buf)
+                if spread < ZERO_SPREAD_DEG:
+                    self.offset = sum(self._zero_buf) / ZERO_N
+                    self.yaw_offset = self._pending_yaw
+                    self.zeroed = True
+                    if self.resid_ref is None:
+                        self.resid_ref = self.resid
+                    drift = self.resid - self.resid_ref
+                    print("IMU zero: pitch %+.2f deg, yaw %+.2f deg, "
+                          "out-of-plane %+.4f (drift %+.4f)"
+                          % (self.offset, self.yaw_offset, self.resid, drift))
+                    if abs(drift) > PIVOT_DRIFT_WARN:
+                        print("  WARNING: the IMU bracket appears to have "
+                              "moved. Rerun calib_pivot.py.")
+
+        # Re-wrap after removing the offset. atan2 returns +-180, but the
+        # subtraction pushes the result outside that range, so a single physical
+        # position can read 360 deg apart depending on which side of the atan2
+        # cut the raw value falls. That step is what breaks the loop.
+        self.pitch = (raw_pitch - self.offset + 180.0) % 360.0 - 180.0
+
+        # Yaw still goes through the Euler projection and carries the same
+        # distortion as the old pitch did. It is not corrected here because the
+        # Game Rotation Vector has no magnetic reference, so yaw drifts anyway
+        # and must not be closed on. It is kept for monitoring only; robust yaw
+        # needs the HEDS-5540 on that axis.
+        raw_yaw = math.degrees(
             math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
         )
-        self.gyro_pitch = math.degrees(gy)
+        self._pending_yaw = raw_yaw
+        self.yaw = raw_yaw - self.yaw_offset
+
+        # Rate about the pivot axis, not about the sensor y axis. The sign is
+        # the opposite of PIVOT_SIGN: the gravity vector is fixed in the world
+        # and seen from a rotating frame, so d(g_s)/dt = -w x g_s and the
+        # projected angle turns at -(w . n).
+        self.gyro_pitch = -PIVOT_SIGN * math.degrees(
+            gx * PIVOT_N[0] + gy * PIVOT_N[1] + gz * PIVOT_N[2]
+        )
         self.gyro_yaw = math.degrees(gz)
         self.ok = True
 
@@ -310,6 +435,8 @@ class Daemon:
         self.uv_tick = 0
         self.fault = False
         self.acq_seq = 0
+        self.still_time = 0.0
+        self.rezero_done = False
 
         for pin in (ESC_MAIN, ESC_TAIL):
             self.pi.set_mode(pin, pigpio.OUTPUT)
@@ -374,18 +501,45 @@ class Daemon:
 
             with self.lock:
                 status = ST_IMU_OK if self.imu.ok else 0
+                if not self.imu.zeroed:
+                    status |= ST_NOZERO
+                    self.armed = False
+                    self.target = [PWM_NEUTRAL, PWM_NEUTRAL]
                 if self.uv_latched:
                     status |= ST_UNDERVOLT
                 if now - self.last_cmd > WATCHDOG_S:
                     self.armed = False
                     self.target = [PWM_NEUTRAL, PWM_NEUTRAL]
                     status |= ST_WATCHDOG
-                if abs(pitch) > PITCH_LIMIT_DEG or abs(yaw) > YAW_LIMIT_DEG:
+                over_pitch = ENC_PITCH_PRESENT and abs(pitch) > PITCH_LIMIT_DEG
+                over_yaw = ENC_YAW_PRESENT and abs(yaw) > YAW_LIMIT_DEG
+                if self.imu.ok and IMU_PITCH_LIMIT:
+                    # The encoder reads zero when none is wired, which leaves the
+                    # limit inert. The IMU pitch is zeroed at rest so it is a
+                    # usable absolute angle. The IMU yaw is not: the game
+                    # rotation vector has no magnetic reference, so it drifts and
+                    # would trip the limit continuously. Yaw protection therefore
+                    # relies on its encoder alone.
+                    over_pitch = over_pitch or abs(self.imu.pitch) > PITCH_LIMIT_DEG
+                if over_pitch or over_yaw:
                     self.armed = False
                     self.target = [PWM_NEUTRAL, PWM_NEUTRAL]
                     status |= ST_LIMIT
                 if self.armed:
                     status |= ST_ARMED
+                    self.still_time = 0.0
+                    self.rezero_done = False
+                elif AUTO_REZERO and not self.rezero_done:
+                    still = abs(rate_pitch) < AUTO_REZERO_RATE
+                    near = abs(self.imu.pitch) < AUTO_REZERO_BAND
+                    if still and near and self.imu.zeroed:
+                        self.still_time += ACQ_DT
+                        if self.still_time >= AUTO_REZERO_S:
+                            self.still_time = 0.0
+                            self.rezero_done = True
+                            self.imu.request_zero()
+                    elif not still:
+                        self.still_time = 0.0
 
                 max_step = SLEW_US_PER_S * ACQ_DT
                 out = []
@@ -453,8 +607,12 @@ class Daemon:
                 with self.lock:
                     self.status &= ~ST_CRC_ERR
                     self.armed = bool(fields[2] & 0x01)
+                    rezero = bool(fields[2] & 0x02)
                     self.target = [fields[6], fields[7]]
                     self.last_cmd = time.perf_counter()
+
+                if rezero:
+                    self.imu.request_zero()
 
                 if PACE_ON_TICK:
                     with self.tick_cv:

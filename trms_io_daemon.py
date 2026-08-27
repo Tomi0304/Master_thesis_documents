@@ -47,8 +47,14 @@ SLEW_US_PER_S = 3000.0
 # Euler projection could never reach because that projection saturated near
 # 110 deg: the interlock was inert. With the pivot projection the angle is a
 # true angle, so set a value that means something.
-PITCH_LIMIT_DEG = 110.0
+PITCH_LIMIT_DEG = 95.0
 YAW_LIMIT_DEG = 65.0
+
+# Once tripped the interlock stays tripped until the arm is well back inside.
+# Without this hysteresis it releases the instant the angle dips below the
+# threshold, and the bench cycles between saturated command and cutoff: the
+# arm falls, re-arms on a command that is still saturated, and climbs again.
+LIMIT_RELEASE_DEG = 15.0
 
 # Back the pitch limit with the IMU as well as the encoder. Set False only if a
 # pitch encoder is wired and trusted on its own.
@@ -98,9 +104,11 @@ UNDERVOLT_GLOB = "/sys/class/hwmon/hwmon*/in0_lcrit_alarm"
 UNDERVOLT_PERIOD = 100
 
 # With patch_bno08x_batch_fault() applied, a malformed batch costs one report
-# instead of the whole stream, so the IMU can be polled at the full loop rate
-# again. Raise IMU_DIV if the I2C bus needs relief.
-IMU_DIV = 2
+# instead of the whole stream, so the IMU can be polled at the full loop rate.
+# At IMU_DIV = 2 the angle is refreshed at 25 Hz only, so the measurement the
+# loop closes on is up to 40 ms old: 3.4 deg of phase at 1.5 rad/s. Raise it
+# back to 2 only if CPU goes past ~70 %: top -bn1 | grep python3
+IMU_DIV = 1
 
 IMU_ENABLE_GYRO = True
 
@@ -437,6 +445,7 @@ class Daemon:
         self.acq_seq = 0
         self.still_time = 0.0
         self.rezero_done = False
+        self.limit_latched = False
 
         for pin in (ESC_MAIN, ESC_TAIL):
             self.pi.set_mode(pin, pigpio.OUTPUT)
@@ -522,6 +531,11 @@ class Daemon:
                     # relies on its encoder alone.
                     over_pitch = over_pitch or abs(self.imu.pitch) > PITCH_LIMIT_DEG
                 if over_pitch or over_yaw:
+                    self.limit_latched = True
+                elif self.limit_latched and self.imu.ok and \
+                        abs(self.imu.pitch) < PITCH_LIMIT_DEG - LIMIT_RELEASE_DEG:
+                    self.limit_latched = False
+                if self.limit_latched:
                     self.armed = False
                     self.target = [PWM_NEUTRAL, PWM_NEUTRAL]
                     status |= ST_LIMIT
@@ -530,7 +544,11 @@ class Daemon:
                     self.still_time = 0.0
                     self.rezero_done = False
                 elif AUTO_REZERO and not self.rezero_done:
-                    still = abs(rate_pitch) < AUTO_REZERO_RATE
+                    # From the IMU, not the encoder: with ENC_PITCH_PRESENT
+                    # False the counter never moves, so rate_pitch is always 0
+                    # and this test always passes -- the zero could then be
+                    # re-taken on a moving arm after any limit trip.
+                    still = abs(self.imu.gyro_pitch) < AUTO_REZERO_RATE
                     near = abs(self.imu.pitch) < AUTO_REZERO_BAND
                     if still and near and self.imu.zeroed:
                         self.still_time += ACQ_DT

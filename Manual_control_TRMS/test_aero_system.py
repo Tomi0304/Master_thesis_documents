@@ -12,8 +12,8 @@ PIN_TAIL = 13
 NEUTRAL  = 1500
 MIN_PW   = 1100
 MAX_PW   = 1900
-DEADBAND = 25
-STEP     = 25   
+DEADBAND = 5
+STEP     = 5
 
 def clamp(v):
     return int(max(MIN_PW, min(MAX_PW, v)))
@@ -49,12 +49,12 @@ HELP = """
 ║         TRMS — Test boucle ouverte               ║
 ╠══════════════════════════════════════════════════╣
 ║  MAIN rotor (GPIO 12)    TAIL rotor (GPIO 13)    ║
-║  w : +{step}µs               i : +{step}µs              ║
-║  s : -{step}µs               k : -{step}µs              ║
+║  w : +{step}µs               i : +{step}µs       ║
+║  s : -{step}µs               k : -{step}µs       ║
 ║  a : NEUTRE main         j : NEUTRE tail         ║
 ║  ESPACE : NEUTRE les deux                        ║
-║  z : +{big}µs MAIN          u : +{big}µs TAIL          ║
-║  x : -{big}µs MAIN          m : -{big}µs TAIL          ║
+║  z : +{big}µs MAIN          u : +{big}µs TAIL    ║
+║  x : -{big}µs MAIN          m : -{big}µs TAIL    ║
 ║  q : QUITTER (neutre + shutdown)                 ║
 ╚══════════════════════════════════════════════════╝
 """.format(step=STEP, big=STEP*4)
